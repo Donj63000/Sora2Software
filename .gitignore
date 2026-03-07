@@ -1,0 +1,51 @@
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+*.local
+
+# Local app state
+social_accounts.json
+sora_videos_history.json
+
+# Generated outputs
+videos/
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Backups / temp files
+*.bak
+*.bak_*
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
