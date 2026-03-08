@@ -60,6 +60,26 @@ APP_MANAGED_ENV_KEYS = {
 }
 TIKTOK_CLIENT_SECRET_KEYRING_NAME = "tiktok_client_secret"
 FACEBOOK_APP_SECRET_KEYRING_NAME = "facebook_app_secret"
+DEFAULT_WINDOW_WIDTH = 1440
+DEFAULT_WINDOW_HEIGHT = 900
+MIN_WINDOW_WIDTH = 960
+MIN_WINDOW_HEIGHT = 640
+WINDOW_MARGIN_X = 40
+WINDOW_MARGIN_Y = 48
+COMPACT_LAYOUT_WIDTH = 1440
+COMPACT_LAYOUT_HEIGHT = 820
+
+LIBRARY_DETAIL_FIELDS = (
+    ("modele", "Modèle"),
+    ("duree", "Durée"),
+    ("format", "Format"),
+    ("taille", "Taille"),
+    ("reseaux", "Réseaux"),
+    ("publications", "Publications"),
+    ("date", "Date"),
+    ("etat", "Statut"),
+    ("chemin", "Chemin"),
+)
 
 WIN11_THEME = {
     "colors": {
@@ -233,17 +253,67 @@ def load_env(path: str) -> None:
                     os.environ.setdefault(key, value)
 
 
+def choose_layout_mode(width: int, height: int) -> str:
+    if int(width) < COMPACT_LAYOUT_WIDTH or int(height) < COMPACT_LAYOUT_HEIGHT:
+        return "compact"
+    return "regular"
+
+
+def compute_initial_window_geometry(screen_width: int, screen_height: int) -> tuple[int, int, int, int]:
+    safe_width = max(int(screen_width) - WINDOW_MARGIN_X, min(MIN_WINDOW_WIDTH, int(screen_width)))
+    safe_height = max(
+        int(screen_height) - WINDOW_MARGIN_Y,
+        min(MIN_WINDOW_HEIGHT, int(screen_height)),
+    )
+    width = min(DEFAULT_WINDOW_WIDTH, max(1, safe_width), int(screen_width))
+    height = min(DEFAULT_WINDOW_HEIGHT, max(1, safe_height), int(screen_height))
+    x = max((int(screen_width) - width) // 2, 0)
+    y = max((int(screen_height) - height) // 2, 0)
+    return width, height, x, y
+
+
+def build_history_detail_items(
+    record: dict[str, Any],
+    *,
+    file_exists: bool,
+    formatted_date: str,
+    formatted_size: str,
+    social_ready: bool,
+) -> dict[str, str]:
+    path = str(record.get("path") or "")
+    duration = record.get("duration_seconds")
+    duration_label = f"{duration}s" if isinstance(duration, int) else "-"
+    return {
+        "modele": str(record.get("model") or "-"),
+        "duree": duration_label,
+        "format": str(record.get("resolution") or "-"),
+        "taille": formatted_size,
+        "reseaux": "Prêt" if social_ready else "Classique",
+        "publications": str(len(record.get("social_posts") or [])),
+        "date": formatted_date,
+        "etat": "Disponible" if file_exists else "Fichier introuvable",
+        "chemin": path or "-",
+    }
+
+
 class SoraVideoApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("SoraStudio")
-        self.geometry("1440x900")
-        self.minsize(1180, 760)
+        screen_width = max(int(self.winfo_screenwidth()), MIN_WINDOW_WIDTH)
+        screen_height = max(int(self.winfo_screenheight()), MIN_WINDOW_HEIGHT)
+        window_width, window_height, pos_x, pos_y = compute_initial_window_geometry(
+            screen_width,
+            screen_height,
+        )
+        self.geometry(f"{window_width}x{window_height}+{pos_x}+{pos_y}")
+        self.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.colors = WIN11_THEME["colors"].copy()
         self.fonts = WIN11_THEME["fonts"].copy()
         self.metrics = WIN11_THEME["metrics"].copy()
         self.configure(bg=self.colors["bg"])
+        self.layout_mode = choose_layout_mode(window_width, window_height)
 
         self.model_var = tk.StringVar(value=DEFAULT_MODEL)
         self.seconds_var = tk.StringVar(value=DEFAULT_SECONDS)
@@ -330,17 +400,21 @@ class SoraVideoApp(tk.Tk):
         self.library_cards_frame: Optional[tk.Frame] = None
         self.history_title_var = tk.StringVar(value="Aucune vidéo sélectionnée")
         self.history_meta_var = tk.StringVar(value="Sélectionne un rendu pour voir ses détails.")
-        self.history_prompt_var = tk.StringVar(value="")
+        self.history_status_var = tk.StringVar(value="Aucune vidéo sélectionnée")
+        self.history_status_note_var = tk.StringVar(
+            value="Choisis un rendu pour afficher les actions et ouvrir la vidéo."
+        )
         self.history_reuse_btn: Optional[ttk.Button] = None
         self.library_empty_var = tk.StringVar(value="Aucun rendu ne correspond au filtre.")
+        self.history_detail_vars = {
+            key: tk.StringVar(value="-")
+            for key, _label in LIBRARY_DETAIL_FIELDS
+        }
         self.social_posts_list_frame: Optional[tk.Frame] = None
         self.social_posts_empty_var = tk.StringVar(value="Aucune publication récente.")
 
         self.history_tree: Optional[ttk.Treeview] = None
-        self.history_count_var = tk.StringVar(value="0 videos")
-        self.history_details_var = tk.StringVar(
-            value="Selectionne une video pour afficher son resume, son etat et son chemin complet."
-        )
+        self.history_count_var = tk.StringVar(value="0 vidéos")
         self.history_open_btn: Optional[ttk.Button] = None
         self.history_export_btn: Optional[ttk.Button] = None
         self.history_delete_btn: Optional[ttk.Button] = None
@@ -375,6 +449,16 @@ class SoraVideoApp(tk.Tk):
         self.social_scroll_frame: Optional[tk.Frame] = None
         self.social_scroll_window_id: Optional[int] = None
         self.social_scroll_binding_active = False
+        self.main_shell: Optional[tk.Frame] = None
+        self.sidebar_frame: Optional[tk.Frame] = None
+        self.generate_layout: dict[str, tk.Widget] = {}
+        self.library_layout: dict[str, tk.Widget] = {}
+        self.social_layout: dict[str, tk.Widget] = {}
+        self.history_status_panel: Optional[tk.Frame] = None
+        self.history_status_title_label: Optional[tk.Label] = None
+        self.history_status_note_label: Optional[tk.Label] = None
+        self.history_prompt_textbox: Optional[tk.Text] = None
+        self.history_detail_value_labels: dict[str, tk.Label] = {}
 
         self.tiktok_client_key_entry: Optional[ttk.Entry] = None
         self.tiktok_client_secret_entry: Optional[ttk.Entry] = None
@@ -394,6 +478,9 @@ class SoraVideoApp(tk.Tk):
         self._set_history_actions_state(has_selection=False, file_exists=False)
         self._load_social_accounts()
         self._refresh_social_state()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Configure>", self._queue_responsive_layout, add="+")
+        self.after_idle(lambda: self._apply_responsive_layout(force=True))
 
     def _setup_style(self) -> None:
         style = ttk.Style(self)
@@ -425,7 +512,7 @@ class SoraVideoApp(tk.Tk):
             darkcolor=self.colors["accent"],
             lightcolor=self.colors["accent"],
             focuscolor=self.colors["accent"],
-            focusthickness=0,
+            focusthickness=1,
             padding=(18, 12),
             font=self.fonts["ui_bold"],
             relief="flat",
@@ -433,63 +520,64 @@ class SoraVideoApp(tk.Tk):
         style.map(
             "Primary.TButton",
             background=[("active", self.colors["accent_alt"]), ("pressed", self.colors["accent_alt"]), ("disabled", self.colors["button_shadow"])],
-            foreground=[("disabled", "#F7F7FA")],
-            bordercolor=[("active", self.colors["accent_alt"]), ("pressed", self.colors["accent_alt"]), ("disabled", self.colors["button_shadow"])],
+            foreground=[("disabled", "#DEE0E7")],
+            bordercolor=[("focus", self.colors["hero_subtle"]), ("active", self.colors["accent_alt"]), ("pressed", self.colors["accent_alt"]), ("disabled", self.colors["button_shadow"])],
         )
         style.configure(
             "Secondary.TButton",
-            background=self.colors["panel_alt_2"],
+            background=self.colors["button_light"],
             foreground=self.colors["ink"],
-            bordercolor=self.colors["input_border"],
-            darkcolor=self.colors["panel_alt_2"],
-            lightcolor=self.colors["panel_alt_2"],
+            bordercolor=self.colors["panel_border"],
+            darkcolor=self.colors["button_light"],
+            lightcolor=self.colors["button_light"],
             focuscolor=self.colors["input_focus"],
-            focusthickness=0,
+            focusthickness=1,
             padding=(14, 10),
             font=self.fonts["ui_bold"],
             relief="flat",
         )
         style.map(
             "Secondary.TButton",
-            background=[("active", self.colors["button_hover"]), ("pressed", self.colors["button_light"]), ("disabled", self.colors["panel_alt_2"])],
-            foreground=[("disabled", self.colors["muted"])],
-            bordercolor=[("focus", self.colors["input_focus"]), ("active", self.colors["panel_border"]), ("disabled", self.colors["panel_border"])],
+            background=[("active", self.colors["panel_alt_2"]), ("pressed", self.colors["button_hover"]), ("disabled", self.colors["panel_alt"])],
+            foreground=[("disabled", self.colors["muted_soft"])],
+            bordercolor=[("focus", self.colors["input_focus"]), ("active", self.colors["input_focus"]), ("disabled", self.colors["panel_border"])],
         )
         style.configure(
             "Ghost.TButton",
-            background=self.colors["panel_alt"],
-            foreground=self.colors["muted"],
+            background=self.colors["panel"],
+            foreground=self.colors["ink"],
             bordercolor=self.colors["panel_border"],
-            darkcolor=self.colors["panel_alt"],
-            lightcolor=self.colors["panel_alt"],
+            darkcolor=self.colors["panel"],
+            lightcolor=self.colors["panel"],
             focuscolor=self.colors["input_focus"],
-            focusthickness=0,
+            focusthickness=1,
             padding=(10, 7),
             font=self.fonts["ui_small"],
             relief="flat",
         )
         style.map(
             "Ghost.TButton",
-            background=[("active", self.colors["panel_alt_2"]), ("pressed", self.colors["button_hover"]), ("disabled", self.colors["panel_alt"])],
-            foreground=[("active", self.colors["ink"]), ("disabled", self.colors["muted"])],
+            background=[("active", self.colors["panel_alt"]), ("pressed", self.colors["button_hover"]), ("disabled", self.colors["panel"])],
+            foreground=[("disabled", self.colors["muted_soft"])],
+            bordercolor=[("focus", self.colors["input_focus"]), ("active", self.colors["panel_border"]), ("disabled", self.colors["panel_border"])],
         )
         style.configure(
             "SmallGhost.TButton",
             background=self.colors["panel"],
-            foreground=self.colors["muted"],
+            foreground=self.colors["ink"],
             bordercolor=self.colors["panel"],
             darkcolor=self.colors["panel"],
             lightcolor=self.colors["panel"],
             focuscolor=self.colors["input_focus"],
-            focusthickness=0,
+            focusthickness=1,
             padding=(6, 4),
             font=self.fonts["ui_small"],
             relief="flat",
         )
         style.map(
             "SmallGhost.TButton",
-            background=[("active", self.colors["panel_alt_2"]), ("pressed", self.colors["button_hover"])],
-            foreground=[("active", self.colors["ink"])],
+            background=[("active", self.colors["panel_alt_2"]), ("pressed", self.colors["button_hover"]), ("disabled", self.colors["panel"])],
+            foreground=[("disabled", self.colors["muted_soft"])],
         )
         style.configure(
             "SidebarNav.TButton",
@@ -672,6 +760,7 @@ class SoraVideoApp(tk.Tk):
             self.social_note_var.set(
                 "Mode reseaux actif: generation 9:16 premium prete pour TikTok et Facebook Reels."
             )
+            self._queue_responsive_layout()
             return
 
         if self.size_combo is not None and not self.running:
@@ -682,6 +771,7 @@ class SoraVideoApp(tk.Tk):
         self.social_note_var.set(
             "Active un rendu vertical 9:16 optimise TikTok et Facebook Reels."
         )
+        self._queue_responsive_layout()
 
     def _sanitize_video_name(self, raw_name: str) -> str:
         invalid_chars = '<>:"/\\|?*'
@@ -883,6 +973,21 @@ class SoraVideoApp(tk.Tk):
         inner.pack(fill="both", expand=True, padx=(0, 1), pady=(0, 1))
         return shell, inner
 
+    def _create_sidebar_block(
+        self,
+        parent: tk.Widget,
+        inner_padding: tuple[int, int] = (14, 14),
+    ) -> tuple[tk.Frame, tk.Frame]:
+        return self._create_soft_panel(parent, "sidebar_alt", inner_padding)
+
+    def _set_readonly_text(self, widget: Optional[tk.Text], value: str) -> None:
+        if widget is None:
+            return
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", value)
+        widget.configure(state="disabled")
+
     def _select_tab(self, index: int) -> None:
         if self.notebook is None:
             return
@@ -934,9 +1039,9 @@ class SoraVideoApp(tk.Tk):
         shell.rowconfigure(0, weight=1)
         self.main_shell = shell
 
-        sidebar = tk.Frame(shell, bg=self.colors["sidebar"], width=290, padx=14, pady=14)
+        sidebar = tk.Frame(shell, bg=self.colors["sidebar"], padx=14, pady=14)
         sidebar.grid(row=0, column=0, sticky="nsw", padx=(0, 18))
-        sidebar.grid_propagate(False)
+        self.sidebar_frame = sidebar
         self._build_sidebar(sidebar)
 
         workspace = tk.Frame(shell, bg=self.colors["bg"])
@@ -966,6 +1071,7 @@ class SoraVideoApp(tk.Tk):
             "Configure le prompt puis appuie sur Entrée pour lancer un rendu.",
             title="Bienvenue dans SoraStudio",
         )
+        self._apply_responsive_layout(force=True)
 
     def _create_scrollable_region(
         self,
@@ -1013,6 +1119,350 @@ class SoraVideoApp(tk.Tk):
         delta = int(-1 * (event.delta / 120))
         self._mousewheel_canvas.yview_scroll(delta, "units")
 
+    def _queue_responsive_layout(self, event: Any = None) -> None:
+        if event is not None and event.widget is not self:
+            return
+        pending = getattr(self, "_layout_after_id", None)
+        if pending:
+            self.after_cancel(pending)
+        self._layout_after_id = self.after(90, self._apply_responsive_layout)
+
+    def _available_wraplength(
+        self,
+        widget: Optional[tk.Widget],
+        fallback: int,
+        padding: int = 40,
+        minimum: int = 180,
+    ) -> int:
+        if widget is not None:
+            try:
+                width = int(widget.winfo_width()) - padding
+            except Exception:
+                width = 0
+            if width > minimum:
+                return width
+        return fallback
+
+    def _apply_responsive_layout(self, force: bool = False) -> None:
+        self._layout_after_id = None
+        width = max(int(self.winfo_width()), MIN_WINDOW_WIDTH)
+        height = max(int(self.winfo_height()), MIN_WINDOW_HEIGHT)
+        layout_signature = (choose_layout_mode(width, height), width, height)
+        if not force and getattr(self, "_last_layout_signature", None) == layout_signature:
+            return
+        self._last_layout_signature = layout_signature
+        self.layout_mode = layout_signature[0]
+        self._layout_main_shell()
+        self._layout_generate_view()
+        self._layout_library_view()
+        self._layout_social_workspace()
+        self._refresh_responsive_content()
+
+    def _layout_main_shell(self) -> None:
+        if self.main_shell is None:
+            return
+        compact = self.layout_mode == "compact"
+        gutter = 12 if compact else 18
+        shell_padding = 12 if compact else 18
+        self.main_shell.configure(padx=shell_padding, pady=shell_padding)
+        self.main_shell.columnconfigure(0, minsize=220 if compact else 250)
+        if self.sidebar_frame is not None:
+            self.sidebar_frame.grid_configure(padx=(0, gutter))
+            self.sidebar_frame.configure(padx=12 if compact else 14, pady=12 if compact else 14)
+
+    def _layout_generate_view(self) -> None:
+        parent = self.view_frames.get("generate")
+        feed_shell = self.generate_layout.get("feed_shell")
+        rail_shell = self.generate_layout.get("rail_shell")
+        composer_shell = self.generate_layout.get("composer_shell")
+        if parent is None or feed_shell is None or rail_shell is None or composer_shell is None:
+            return
+
+        compact = self.layout_mode == "compact"
+        gutter = 12 if compact else 18
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=0 if not compact else 0, minsize=0)
+        parent.rowconfigure(0, weight=1 if not compact else 0)
+        parent.rowconfigure(1, weight=0)
+        parent.rowconfigure(2, weight=1 if compact else 0)
+
+        for shell in (feed_shell, rail_shell, composer_shell):
+            shell.grid_forget()
+
+        if compact:
+            composer_shell.grid(row=0, column=0, sticky="ew")
+            rail_shell.grid(row=1, column=0, sticky="ew", pady=(gutter, 0))
+            feed_shell.grid(row=2, column=0, sticky="nsew", pady=(gutter, 0))
+        else:
+            feed_shell.grid(row=0, column=0, sticky="nsew", padx=(0, gutter))
+            rail_shell.grid(row=0, column=1, sticky="nsew")
+            composer_shell.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(gutter, 0))
+
+        self._layout_generate_controls()
+        self._layout_generate_footer()
+        self._layout_generate_status_actions()
+
+    def _layout_generate_controls(self) -> None:
+        controls_row = self.generate_layout.get("controls_row")
+        model_entry = self.generate_layout.get("model_entry")
+        seconds_combo = self.generate_layout.get("seconds_combo")
+        size_combo = self.generate_layout.get("size_combo")
+        advanced_btn = self.generate_layout.get("advanced_btn")
+        if not all((controls_row, model_entry, seconds_combo, size_combo, advanced_btn)):
+            return
+
+        for index in range(4):
+            controls_row.columnconfigure(index, weight=0, minsize=0)
+        for widget in (model_entry, seconds_combo, size_combo, advanced_btn):
+            widget.grid_forget()
+
+        if self.layout_mode == "compact":
+            controls_row.columnconfigure(0, weight=1)
+            controls_row.columnconfigure(1, weight=1)
+            model_entry.grid(row=0, column=0, columnspan=2, sticky="ew")
+            seconds_combo.grid(row=1, column=0, sticky="ew", pady=(8, 0), padx=(0, 8))
+            size_combo.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+            advanced_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            return
+
+        controls_row.columnconfigure(0, weight=2)
+        controls_row.columnconfigure(1, weight=1)
+        controls_row.columnconfigure(2, weight=1)
+        controls_row.columnconfigure(3, weight=0)
+        model_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        seconds_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        size_combo.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        advanced_btn.grid(row=0, column=3, sticky="e")
+
+    def _layout_generate_footer(self) -> None:
+        footer = self.generate_layout.get("footer")
+        social_check = self.generate_layout.get("social_check")
+        social_note = self.generate_layout.get("social_note")
+        reset_btn = self.generate_layout.get("reset_btn")
+        generate_btn = self.generate_layout.get("generate_btn")
+        if not all((footer, social_check, social_note, reset_btn, generate_btn)):
+            return
+
+        for index in range(3):
+            footer.columnconfigure(index, weight=0, minsize=0)
+        for widget in (social_check, social_note, reset_btn, generate_btn):
+            widget.grid_forget()
+
+        if self.layout_mode == "compact":
+            footer.columnconfigure(0, weight=1)
+            footer.columnconfigure(1, weight=1)
+            social_check.grid(row=0, column=0, columnspan=2, sticky="w")
+            social_note.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+            reset_btn.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+            generate_btn.grid(row=2, column=1, sticky="ew", padx=(10, 0), pady=(12, 0))
+            return
+
+        footer.columnconfigure(0, weight=1)
+        footer.columnconfigure(1, weight=0)
+        footer.columnconfigure(2, weight=0)
+        social_check.grid(row=0, column=0, sticky="w")
+        social_note.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        reset_btn.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
+        generate_btn.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
+
+    def _layout_generate_status_actions(self) -> None:
+        actions = self.generate_layout.get("status_actions")
+        library_btn = self.generate_layout.get("status_library_btn")
+        output_btn = self.generate_layout.get("status_output_btn")
+        if not all((actions, library_btn, output_btn)):
+            return
+        for index in range(2):
+            actions.columnconfigure(index, weight=0, minsize=0)
+        for widget in (library_btn, output_btn):
+            widget.grid_forget()
+        if self.layout_mode == "compact":
+            actions.columnconfigure(0, weight=1)
+            library_btn.grid(row=0, column=0, sticky="ew")
+            output_btn.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            return
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        library_btn.grid(row=0, column=0, sticky="ew")
+        output_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+    def _layout_library_view(self) -> None:
+        parent = self.view_frames.get("library")
+        header = self.library_layout.get("header")
+        title = self.library_layout.get("title")
+        subtitle = self.library_layout.get("subtitle")
+        filter_entry = self.library_layout.get("filter")
+        search_shell = self.library_layout.get("search_shell")
+        list_shell = self.library_layout.get("list_shell")
+        detail_shell = self.library_layout.get("detail_shell")
+        if not all((parent, header, title, subtitle, filter_entry, search_shell, list_shell, detail_shell)):
+            return
+
+        compact = self.layout_mode == "compact"
+        gutter = 12 if compact else 16
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=4 if not compact else 0, minsize=0)
+        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1 if compact else 0)
+
+        header.columnconfigure(0, weight=1)
+        title.grid_forget()
+        subtitle.grid_forget()
+        search_shell.grid_forget()
+        title.grid(row=0, column=0, sticky="w")
+        subtitle.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        if compact:
+            search_shell.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        else:
+            search_shell.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 0))
+
+        for shell in (list_shell, detail_shell):
+            shell.grid_forget()
+        if compact:
+            list_shell.grid(row=1, column=0, sticky="nsew")
+            detail_shell.grid(row=2, column=0, sticky="nsew", pady=(gutter, 0))
+        else:
+            list_shell.grid(row=1, column=0, sticky="nsew", padx=(0, gutter))
+            detail_shell.grid(row=1, column=1, sticky="nsew")
+
+        self._layout_library_actions()
+
+    def _layout_library_actions(self) -> None:
+        actions = self.library_layout.get("actions")
+        open_btn = self.library_layout.get("open_btn")
+        export_btn = self.library_layout.get("export_btn")
+        reuse_btn = self.library_layout.get("reuse_btn")
+        delete_btn = self.library_layout.get("delete_btn")
+        if not all((actions, open_btn, export_btn, reuse_btn, delete_btn)):
+            return
+        for index in range(4):
+            actions.columnconfigure(index, weight=0, minsize=0)
+        for widget in (open_btn, reuse_btn, export_btn, delete_btn):
+            widget.grid_forget()
+        if self.layout_mode == "compact":
+            actions.columnconfigure(0, weight=1)
+            open_btn.grid(row=0, column=0, sticky="ew")
+            reuse_btn.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            export_btn.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+            delete_btn.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        else:
+            actions.columnconfigure(0, weight=1)
+            actions.columnconfigure(1, weight=1)
+            actions.columnconfigure(2, weight=1)
+            actions.columnconfigure(3, weight=1)
+            open_btn.grid(row=0, column=0, sticky="ew")
+            reuse_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+            export_btn.grid(row=0, column=2, sticky="ew", padx=(8, 0))
+            delete_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+    def _layout_social_workspace(self) -> None:
+        body = self.social_layout.get("body")
+        accounts = self.social_layout.get("accounts")
+        publish_shell = self.social_layout.get("publish_shell")
+        if not all((body, accounts, publish_shell)):
+            return
+        compact = self.layout_mode == "compact"
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0 if compact else 4, minsize=0)
+        body.rowconfigure(0, weight=1)
+        body.rowconfigure(1, weight=0)
+        accounts.grid_forget()
+        publish_shell.grid_forget()
+        if compact:
+            accounts.grid(row=0, column=0, sticky="nsew")
+            publish_shell.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        else:
+            accounts.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+            publish_shell.grid(row=0, column=1, sticky="nsew")
+        self._layout_social_header_actions()
+
+    def _layout_social_header_actions(self) -> None:
+        action_wrap = self.social_layout.get("action_wrap")
+        help_btn = self.social_layout.get("help_btn")
+        tiktok_btn = self.social_layout.get("tiktok_btn")
+        facebook_btn = self.social_layout.get("facebook_btn")
+        if not all((action_wrap, help_btn, tiktok_btn, facebook_btn)):
+            return
+        for index in range(3):
+            action_wrap.columnconfigure(index, weight=0, minsize=0)
+        for widget in (help_btn, tiktok_btn, facebook_btn):
+            widget.grid_forget()
+        if self.layout_mode == "compact":
+            action_wrap.columnconfigure(0, weight=1)
+            action_wrap.columnconfigure(1, weight=1)
+            help_btn.grid(row=0, column=0, columnspan=2, sticky="ew")
+            tiktok_btn.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            facebook_btn.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+            return
+        help_btn.grid(row=0, column=0, sticky="ew")
+        tiktok_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        facebook_btn.grid(row=0, column=2, sticky="ew", padx=(8, 0))
+
+    def _refresh_responsive_content(self) -> None:
+        status_width = self._available_wraplength(
+            self.generate_layout.get("status_card"),
+            520 if self.layout_mode == "compact" else 280,
+            padding=54,
+            minimum=220,
+        )
+        status_label = self.generate_layout.get("status_label")
+        status_detail = self.generate_layout.get("status_detail")
+        social_note = self.generate_layout.get("social_note")
+        if status_label is not None:
+            status_label.configure(wraplength=status_width)
+        if status_detail is not None:
+            status_detail.configure(wraplength=status_width)
+        if social_note is not None:
+            social_note.configure(
+                wraplength=self._available_wraplength(
+                    self.generate_layout.get("footer"),
+                    620 if self.layout_mode == "compact" else 540,
+                    padding=44,
+                    minimum=220,
+                )
+            )
+
+        detail_width = self._available_wraplength(
+            self.library_layout.get("detail_card"),
+            620 if self.layout_mode == "compact" else 360,
+            padding=46,
+            minimum=240,
+        )
+        history_meta = self.library_layout.get("meta_label")
+        if history_meta is not None:
+            history_meta.configure(wraplength=detail_width)
+        if self.history_status_note_label is not None:
+            self.history_status_note_label.configure(wraplength=detail_width)
+        if self.history_prompt_textbox is not None:
+            self.history_prompt_textbox.configure(height=8 if self.layout_mode == "compact" else 10)
+        for key, label in self.history_detail_value_labels.items():
+            label.configure(wraplength=detail_width if key == "chemin" else max(150, (detail_width - 24) // 2))
+
+        social_status = self.social_layout.get("status_label")
+        if social_status is not None:
+            social_status.configure(
+                wraplength=self._available_wraplength(
+                    self.social_layout.get("header_card"),
+                    980 if self.layout_mode == "regular" else 640,
+                    padding=64,
+                    minimum=240,
+                )
+            )
+        tiktok_hint = self.social_layout.get("tiktok_hint")
+        if tiktok_hint is not None:
+            tiktok_hint.configure(
+                wraplength=self._available_wraplength(
+                    self.social_layout.get("accounts"),
+                    420 if self.layout_mode == "regular" else 620,
+                    padding=80,
+                    minimum=240,
+                )
+            )
+
+        self._render_recent_history_sidebar()
+        self._render_library_cards()
+        self._refresh_social_posts_view()
+        self._render_activity_feed()
+
     def _show_view(self, view_name: str) -> None:
         self.active_view = view_name
         for name, frame in self.view_frames.items():
@@ -1025,35 +1475,51 @@ class SoraVideoApp(tk.Tk):
 
     def _build_sidebar(self, parent: tk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(4, weight=1)
+        parent.rowconfigure(3, weight=1)
 
-        brand = tk.Frame(parent, bg=self.colors["sidebar"])
-        brand.grid(row=0, column=0, sticky="ew")
+        brand_shell, brand = self._create_sidebar_block(parent, inner_padding=(18, 16))
+        brand_shell.grid(row=0, column=0, sticky="ew")
         tk.Label(
             brand,
             text="SoraStudio",
-            bg=self.colors["sidebar"],
+            bg=self.colors["sidebar_alt"],
             fg=self.colors["ink"],
             font=self.fonts["hero_sub"],
         ).pack(anchor="w")
         tk.Label(
             brand,
             text="Studio vidéo IA, version workspace",
-            bg=self.colors["sidebar"],
+            bg=self.colors["sidebar_alt"],
             fg=self.colors["muted"],
             font=self.fonts["ui_small"],
         ).pack(anchor="w", pady=(4, 0))
 
+        cta_shell, cta = self._create_sidebar_block(parent, inner_padding=(14, 14))
+        cta_shell.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        tk.Label(
+            cta,
+            text="Session",
+            bg=self.colors["sidebar_alt"],
+            fg=self.colors["muted"],
+            font=self.fonts["ui_bold_small"],
+        ).pack(anchor="w")
         ttk.Button(
-            parent,
+            cta,
             text="Nouveau rendu",
             style="Primary.TButton",
             command=self._start_new_session,
-        ).grid(row=1, column=0, sticky="ew", pady=(18, 16))
+        ).pack(fill="x", pady=(10, 0))
 
-        nav = tk.Frame(parent, bg=self.colors["sidebar"])
-        nav.grid(row=2, column=0, sticky="ew")
+        nav_shell, nav = self._create_sidebar_block(parent, inner_padding=(14, 14))
+        nav_shell.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         nav.columnconfigure(0, weight=1)
+        tk.Label(
+            nav,
+            text="Navigation",
+            bg=self.colors["sidebar_alt"],
+            fg=self.colors["muted"],
+            font=self.fonts["ui_bold_small"],
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
         self.nav_buttons = {
             "generate": ttk.Button(
                 nav,
@@ -1074,38 +1540,37 @@ class SoraVideoApp(tk.Tk):
                 command=lambda: self._show_view("social"),
             ),
         }
-        self.nav_buttons["generate"].grid(row=0, column=0, sticky="ew")
-        self.nav_buttons["library"].grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        self.nav_buttons["social"].grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.nav_buttons["generate"].grid(row=1, column=0, sticky="ew")
+        self.nav_buttons["library"].grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.nav_buttons["social"].grid(row=3, column=0, sticky="ew", pady=(6, 0))
 
-        ttk.Separator(parent).grid(row=3, column=0, sticky="ew", pady=18)
-
-        recent_shell = tk.Frame(parent, bg=self.colors["sidebar"])
-        recent_shell.grid(row=4, column=0, sticky="nsew")
-        recent_shell.columnconfigure(0, weight=1)
-        recent_shell.rowconfigure(1, weight=1)
-
+        recent_shell, recent_card = self._create_sidebar_block(parent, inner_padding=(14, 14))
+        recent_shell.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        recent_card.columnconfigure(0, weight=1)
+        recent_card.rowconfigure(1, weight=1)
+        top = tk.Frame(recent_card, bg=self.colors["sidebar_alt"])
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
         tk.Label(
-            recent_shell,
+            top,
             text="Rendus récents",
-            bg=self.colors["sidebar"],
+            bg=self.colors["sidebar_alt"],
             fg=self.colors["muted"],
             font=self.fonts["ui_bold_small"],
         ).grid(row=0, column=0, sticky="w")
         recent_list_shell, _recent_canvas, recent_inner, _recent_window = self._create_scrollable_region(
-            recent_shell,
-            self.colors["sidebar"],
+            recent_card,
+            self.colors["sidebar_alt"],
         )
         recent_list_shell.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
         self.recent_history_list = recent_inner
-
         tk.Label(
-            parent,
+            top,
             textvariable=self.history_count_var,
-            bg=self.colors["sidebar"],
+            bg=self.colors["sidebar_alt"],
             fg=self.colors["muted_soft"],
             font=self.fonts["ui_caption"],
-        ).grid(row=5, column=0, sticky="w", pady=(12, 0))
+        ).grid(row=0, column=1, sticky="e")
 
     def _start_new_session(self) -> None:
         if self.running:
@@ -1128,6 +1593,7 @@ class SoraVideoApp(tk.Tk):
 
         feed_shell, feed_card = self._create_card(parent, inner_padding=(0, 0))
         feed_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
+        self.generate_layout["feed_shell"] = feed_shell
         feed_card.columnconfigure(0, weight=1)
         feed_card.rowconfigure(1, weight=1)
 
@@ -1157,12 +1623,13 @@ class SoraVideoApp(tk.Tk):
 
         rail_shell, rail_card = self._create_card(parent, inner_padding=(18, 16))
         rail_shell.grid(row=0, column=1, sticky="nsew")
-        rail_card.configure(width=320)
-        rail_card.grid_propagate(False)
+        self.generate_layout["rail_shell"] = rail_shell
+        self.generate_layout["status_card"] = rail_card
         self._build_generate_status_rail(rail_card)
 
         composer_shell, composer_card = self._create_card(parent, inner_padding=(18, 16))
         composer_shell.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        self.generate_layout["composer_shell"] = composer_shell
         self._build_generate_composer(composer_card)
 
     def _build_generate_status_rail(self, parent: tk.Frame) -> None:
@@ -1189,7 +1656,7 @@ class SoraVideoApp(tk.Tk):
         )
         self.status_chip.grid(row=0, column=1, sticky="e")
 
-        tk.Label(
+        status_label = tk.Label(
             parent,
             textvariable=self.status_var,
             bg=self.colors["panel"],
@@ -1198,8 +1665,9 @@ class SoraVideoApp(tk.Tk):
             wraplength=250,
             justify="left",
             anchor="w",
-        ).grid(row=1, column=0, sticky="ew", pady=(14, 6))
-        tk.Label(
+        )
+        status_label.grid(row=1, column=0, sticky="ew", pady=(14, 6))
+        status_detail = tk.Label(
             parent,
             textvariable=self.status_detail_var,
             bg=self.colors["panel"],
@@ -1208,7 +1676,10 @@ class SoraVideoApp(tk.Tk):
             wraplength=250,
             justify="left",
             anchor="w",
-        ).grid(row=2, column=0, sticky="ew")
+        )
+        status_detail.grid(row=2, column=0, sticky="ew")
+        self.generate_layout["status_label"] = status_label
+        self.generate_layout["status_detail"] = status_detail
 
         progress_shell, progress_card = self._create_soft_panel(parent, "panel_tint", inner_padding=(12, 12))
         progress_shell.grid(row=3, column=0, sticky="ew", pady=(16, 0))
@@ -1249,18 +1720,23 @@ class SoraVideoApp(tk.Tk):
         actions.grid(row=5, column=0, sticky="ew", pady=(12, 0))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
-        ttk.Button(
+        library_btn = ttk.Button(
             actions,
             text="Voir bibliothèque",
             style="Secondary.TButton",
             command=lambda: self._show_view("library"),
-        ).grid(row=0, column=0, sticky="ew")
-        ttk.Button(
+        )
+        library_btn.grid(row=0, column=0, sticky="ew")
+        output_btn = ttk.Button(
             actions,
             text="Ouvrir sortie",
             style="Ghost.TButton",
             command=self._open_current_output,
-        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        )
+        output_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.generate_layout["status_actions"] = actions
+        self.generate_layout["status_library_btn"] = library_btn
+        self.generate_layout["status_output_btn"] = output_btn
 
     def _build_generate_composer(self, parent: tk.Frame) -> None:
         section_gap = int(self.metrics["section_gap"])
@@ -1269,6 +1745,7 @@ class SoraVideoApp(tk.Tk):
 
         controls_row = tk.Frame(parent, bg=self.colors["panel"])
         controls_row.grid(row=0, column=0, sticky="ew")
+        self.generate_layout["controls_row"] = controls_row
         controls_row.columnconfigure(0, weight=2)
         controls_row.columnconfigure(1, weight=1)
         controls_row.columnconfigure(2, weight=1)
@@ -1276,6 +1753,7 @@ class SoraVideoApp(tk.Tk):
 
         model_entry = ttk.Entry(controls_row, textvariable=self.model_var)
         model_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.generate_layout["model_entry"] = model_entry
         self.controls.append(model_entry)
 
         seconds_combo = ttk.Combobox(
@@ -1287,6 +1765,7 @@ class SoraVideoApp(tk.Tk):
             width=10,
         )
         seconds_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.generate_layout["seconds_combo"] = seconds_combo
         self._bind_dropdown_open(seconds_combo)
 
         size_combo = ttk.Combobox(
@@ -1299,6 +1778,7 @@ class SoraVideoApp(tk.Tk):
         size_combo.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         self._bind_dropdown_open(size_combo)
         self.size_combo = size_combo
+        self.generate_layout["size_combo"] = size_combo
         self.controls.extend([seconds_combo, size_combo])
 
         self.advanced_toggle_btn = ttk.Button(
@@ -1308,6 +1788,7 @@ class SoraVideoApp(tk.Tk):
             command=self._toggle_advanced_settings,
         )
         self.advanced_toggle_btn.grid(row=0, column=3, sticky="e")
+        self.generate_layout["advanced_btn"] = self.advanced_toggle_btn
 
         composer_wrap = tk.Frame(
             parent,
@@ -1403,6 +1884,7 @@ class SoraVideoApp(tk.Tk):
 
         footer = tk.Frame(parent, bg=self.colors["panel"])
         footer.grid(row=3, column=0, sticky="ew", pady=(section_gap, 0))
+        self.generate_layout["footer"] = footer
         footer.columnconfigure(0, weight=1)
         footer.columnconfigure(1, weight=0)
         footer.columnconfigure(2, weight=0)
@@ -1422,7 +1904,7 @@ class SoraVideoApp(tk.Tk):
             bd=0,
         )
         self.social_mode_check.grid(row=0, column=0, sticky="w")
-        tk.Label(
+        social_note_label = tk.Label(
             footer,
             textvariable=self.social_note_var,
             bg=self.colors["panel"],
@@ -1430,7 +1912,10 @@ class SoraVideoApp(tk.Tk):
             font=self.fonts["ui_small"],
             wraplength=540,
             justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        )
+        social_note_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.generate_layout["social_check"] = self.social_mode_check
+        self.generate_layout["social_note"] = social_note_label
         self.controls.append(self.social_mode_check)
 
         self.reset_btn = ttk.Button(
@@ -1447,6 +1932,8 @@ class SoraVideoApp(tk.Tk):
             command=self._start_generation,
         )
         self.generate_btn.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
+        self.generate_layout["reset_btn"] = self.reset_btn
+        self.generate_layout["generate_btn"] = self.generate_btn
         self.controls.extend([self.generate_btn, self.reset_btn])
 
     def _toggle_advanced_settings(self) -> None:
@@ -1461,6 +1948,7 @@ class SoraVideoApp(tk.Tk):
             self.advanced_toggle_btn.configure(
                 text="Masquer les paramètres" if self.advanced_settings_visible else "Paramètres avancés"
             )
+        self._queue_responsive_layout()
 
     def _on_prompt_return(self, event: Any) -> Optional[str]:
         if bool(event.state & 0x1):
@@ -1485,53 +1973,103 @@ class SoraVideoApp(tk.Tk):
         parent.columnconfigure(0, weight=5)
         parent.columnconfigure(1, weight=4)
         parent.rowconfigure(1, weight=1)
+        self._build_library_header(parent)
+        self._build_library_list_panel(parent)
+        self._build_library_detail_panel(parent)
 
+    def _build_library_header(self, parent: tk.Frame) -> None:
         header = tk.Frame(parent, bg=self.colors["bg"])
         header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 16))
         header.columnconfigure(0, weight=1)
-        tk.Label(
+
+        title_label = tk.Label(
             header,
             text="Bibliothèque",
             bg=self.colors["bg"],
             fg=self.colors["ink"],
             font=self.fonts["title"],
-        ).grid(row=0, column=0, sticky="w")
-        tk.Label(
+        )
+        title_label.grid(row=0, column=0, sticky="w")
+        subtitle_label = tk.Label(
             header,
-            text="Retrouve chaque rendu, son prompt et ses publications.",
+            text="Retrouve chaque rendu, son prompt et ouvre la vidéo dans ton lecteur habituel.",
             bg=self.colors["bg"],
             fg=self.colors["muted"],
             font=self.fonts["ui_small"],
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(header, textvariable=self.history_filter_var).grid(
-            row=0,
-            column=1,
-            rowspan=2,
-            sticky="e",
-            padx=(16, 0),
+            justify="left",
+            anchor="w",
         )
+        subtitle_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        list_shell, list_card = self._create_card(parent, inner_padding=(16, 16))
-        list_shell.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
-        list_card.columnconfigure(0, weight=1)
-        list_card.rowconfigure(1, weight=1)
+        search_shell, search_card = self._create_soft_panel(
+            header,
+            "panel_alt",
+            inner_padding=(12, 10),
+        )
+        search_card.columnconfigure(0, weight=1)
         tk.Label(
-            list_card,
+            search_card,
+            text="Recherche",
+            bg=self.colors["panel_alt"],
+            fg=self.colors["muted"],
+            font=self.fonts["ui_bold_small"],
+        ).grid(row=0, column=0, sticky="w")
+        filter_entry = ttk.Entry(search_card, textvariable=self.history_filter_var, width=28)
+        filter_entry.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.library_layout["header"] = header
+        self.library_layout["title"] = title_label
+        self.library_layout["subtitle"] = subtitle_label
+        self.library_layout["filter"] = filter_entry
+        self.library_layout["search_shell"] = search_shell
+
+    def _build_library_list_panel(self, parent: tk.Frame) -> None:
+        list_shell, list_card = self._create_card(parent, inner_padding=(18, 18))
+        list_shell.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
+        self.library_layout["list_shell"] = list_shell
+        self.library_layout["list_card"] = list_card
+        list_card.columnconfigure(0, weight=1)
+        list_card.rowconfigure(2, weight=1)
+
+        top = tk.Frame(list_card, bg=self.colors["panel"])
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        tk.Label(
+            top,
             text="Rendus",
             bg=self.colors["panel"],
             fg=self.colors["ink"],
             font=self.fonts["section"],
         ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            top,
+            textvariable=self.history_count_var,
+            bg=self.colors["panel"],
+            fg=self.colors["muted_soft"],
+            font=self.fonts["ui_caption"],
+        ).grid(row=0, column=1, sticky="e")
+        tk.Label(
+            list_card,
+            text="Filtre instantané sur le nom, le prompt, le modèle et le format.",
+            bg=self.colors["panel"],
+            fg=self.colors["muted"],
+            font=self.fonts["ui_small"],
+            justify="left",
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", pady=(6, 0))
         cards_shell, _cards_canvas, cards_inner, _cards_window = self._create_scrollable_region(
             list_card,
             self.colors["panel"],
         )
-        cards_shell.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        cards_shell.grid(row=2, column=0, sticky="nsew", pady=(14, 0))
         self.library_cards_frame = cards_inner
 
-        detail_shell, detail_card = self._create_card(parent, inner_padding=(18, 18))
+    def _build_library_detail_panel(self, parent: tk.Frame) -> None:
+        detail_shell, detail_card = self._create_card(parent, inner_padding=(20, 20))
         detail_shell.grid(row=1, column=1, sticky="nsew")
+        self.library_layout["detail_shell"] = detail_shell
+        self.library_layout["detail_card"] = detail_card
         detail_card.columnconfigure(0, weight=1)
+        detail_card.rowconfigure(4, weight=1)
 
         tk.Label(
             detail_card,
@@ -1542,7 +2080,7 @@ class SoraVideoApp(tk.Tk):
             justify="left",
             anchor="w",
         ).grid(row=0, column=0, sticky="ew")
-        tk.Label(
+        history_meta_label = tk.Label(
             detail_card,
             textvariable=self.history_meta_var,
             bg=self.colors["panel"],
@@ -1551,60 +2089,195 @@ class SoraVideoApp(tk.Tk):
             justify="left",
             anchor="w",
             wraplength=360,
-        ).grid(row=1, column=0, sticky="ew", pady=(10, 16))
+        )
+        history_meta_label.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.library_layout["meta_label"] = history_meta_label
 
-        prompt_shell, prompt_card = self._create_soft_panel(detail_card, "panel_alt", inner_padding=(14, 12))
-        prompt_shell.grid(row=2, column=0, sticky="ew")
+        status_shell, status_card = self._create_soft_panel(
+            detail_card,
+            "panel_tint",
+            inner_padding=(14, 12),
+        )
+        status_shell.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        self.history_status_panel = status_card
+        self.library_layout["status_card"] = status_card
+        self.history_status_title_label = tk.Label(
+            status_card,
+            textvariable=self.history_status_var,
+            bg=self.colors["panel_tint"],
+            fg=self.colors["ink"],
+            font=self.fonts["ui_bold"],
+            justify="left",
+            anchor="w",
+        )
+        self.history_status_title_label.pack(anchor="w")
+        self.history_status_note_label = tk.Label(
+            status_card,
+            textvariable=self.history_status_note_var,
+            bg=self.colors["panel_tint"],
+            fg=self.colors["muted"],
+            font=self.fonts["ui_small"],
+            justify="left",
+            anchor="w",
+            wraplength=360,
+        )
+        self.history_status_note_label.pack(fill="x", pady=(6, 0))
+
+        actions = tk.Frame(detail_card, bg=self.colors["panel"])
+        actions.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        self.history_open_btn = ttk.Button(
+            actions,
+            text="Ouvrir la vidéo",
+            style="Primary.TButton",
+            command=self._history_open_selected,
+        )
+        self.history_reuse_btn = ttk.Button(
+            actions,
+            text="Réutiliser",
+            style="Secondary.TButton",
+            command=self._history_reuse_selected,
+        )
+        self.history_export_btn = ttk.Button(
+            actions,
+            text="Exporter",
+            style="Ghost.TButton",
+            command=self._history_export_selected,
+        )
+        self.history_delete_btn = ttk.Button(
+            actions,
+            text="Supprimer",
+            style="Danger.TButton",
+            command=self._history_delete_selected,
+        )
+        self.library_layout["actions"] = actions
+        self.library_layout["open_btn"] = self.history_open_btn
+        self.library_layout["export_btn"] = self.history_export_btn
+        self.library_layout["reuse_btn"] = self.history_reuse_btn
+        self.library_layout["delete_btn"] = self.history_delete_btn
+
+        prompt_shell, prompt_card = self._create_soft_panel(
+            detail_card,
+            "panel_alt",
+            inner_padding=(14, 12),
+        )
+        prompt_shell.grid(row=4, column=0, sticky="nsew", pady=(16, 0))
+        prompt_card.columnconfigure(0, weight=1)
+        prompt_card.rowconfigure(1, weight=1)
         tk.Label(
             prompt_card,
             text="Prompt",
             bg=self.colors["panel_alt"],
             fg=self.colors["muted"],
             font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w")
-        tk.Message(
-            prompt_card,
-            textvariable=self.history_prompt_var,
+        ).grid(row=0, column=0, sticky="w")
+        prompt_body = tk.Frame(prompt_card, bg=self.colors["panel_alt"])
+        prompt_body.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        prompt_body.columnconfigure(0, weight=1)
+        prompt_body.rowconfigure(0, weight=1)
+        prompt_text = tk.Text(
+            prompt_body,
+            height=10,
             bg=self.colors["panel_alt"],
             fg=self.colors["ink"],
             font=self.fonts["ui_small"],
-            width=360,
-            justify="left",
-        ).pack(fill="x", pady=(8, 0))
+            wrap="word",
+            relief="flat",
+            bd=0,
+            padx=0,
+            pady=0,
+            highlightthickness=0,
+            insertwidth=0,
+        )
+        prompt_text.grid(row=0, column=0, sticky="nsew")
+        prompt_scroll = ttk.Scrollbar(
+            prompt_body,
+            orient="vertical",
+            style="App.Vertical.TScrollbar",
+            command=prompt_text.yview,
+        )
+        prompt_scroll.grid(row=0, column=1, sticky="ns", padx=(10, 0))
+        prompt_text.configure(yscrollcommand=prompt_scroll.set)
+        self.history_prompt_textbox = prompt_text
+        self.library_layout["prompt_text"] = prompt_text
+        self.library_layout["prompt_shell"] = prompt_shell
+        self._set_readonly_text(prompt_text, "Aucun prompt enregistré.")
 
-        details_shell, details_card = self._create_soft_panel(detail_card, "panel_tint", inner_padding=(14, 12))
-        details_shell.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        details_shell, details_card = self._create_soft_panel(
+            detail_card,
+            "panel_tint",
+            inner_padding=(14, 12),
+        )
+        details_shell.grid(row=5, column=0, sticky="ew", pady=(16, 0))
+        details_card.columnconfigure(0, weight=1)
         tk.Label(
             details_card,
             text="Détails",
             bg=self.colors["panel_tint"],
             fg=self.colors["muted"],
             font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w")
-        tk.Message(
-            details_card,
-            textvariable=self.history_details_var,
-            bg=self.colors["panel_tint"],
-            fg=self.colors["ink"],
-            font=self.fonts["ui_small"],
-            width=360,
-            justify="left",
-        ).pack(fill="x", pady=(8, 0))
+        ).grid(row=0, column=0, sticky="w")
+        facts = tk.Frame(details_card, bg=self.colors["panel_tint"])
+        facts.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self._build_library_detail_grid(facts)
 
-        actions = tk.Frame(detail_card, bg=self.colors["panel"])
-        actions.grid(row=4, column=0, sticky="ew", pady=(16, 0))
-        actions.columnconfigure(0, weight=1)
-        actions.columnconfigure(1, weight=1)
-        actions.columnconfigure(2, weight=1)
-        actions.columnconfigure(3, weight=1)
-        self.history_open_btn = ttk.Button(actions, text="Ouvrir", style="Secondary.TButton", command=self._history_open_selected)
-        self.history_open_btn.grid(row=0, column=0, sticky="ew")
-        self.history_export_btn = ttk.Button(actions, text="Exporter", style="Ghost.TButton", command=self._history_export_selected)
-        self.history_export_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        self.history_reuse_btn = ttk.Button(actions, text="Réutiliser", style="Ghost.TButton", command=self._history_reuse_selected)
-        self.history_reuse_btn.grid(row=0, column=2, sticky="ew", padx=(8, 0))
-        self.history_delete_btn = ttk.Button(actions, text="Supprimer", style="Danger.TButton", command=self._history_delete_selected)
-        self.history_delete_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0))
+    def _build_library_detail_grid(self, parent: tk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        compact_fields = [field for field in LIBRARY_DETAIL_FIELDS if field[0] != "chemin"]
+        for index, (key, label_text) in enumerate(compact_fields):
+            shell, cell = self._create_soft_panel(parent, "panel_alt_2", inner_padding=(12, 10))
+            shell.grid(
+                row=index // 2,
+                column=index % 2,
+                sticky="nsew",
+                padx=(0, 8) if index % 2 == 0 else (8, 0),
+                pady=(0, 8),
+            )
+            tk.Label(
+                cell,
+                text=label_text,
+                bg=self.colors["panel_alt_2"],
+                fg=self.colors["muted"],
+                font=self.fonts["ui_bold_small"],
+                anchor="w",
+                justify="left",
+            ).pack(anchor="w")
+            value_label = tk.Label(
+                cell,
+                textvariable=self.history_detail_vars[key],
+                bg=self.colors["panel_alt_2"],
+                fg=self.colors["ink"],
+                font=self.fonts["ui_small"],
+                justify="left",
+                anchor="w",
+                wraplength=180,
+            )
+            value_label.pack(fill="x", pady=(6, 0))
+            self.history_detail_value_labels[key] = value_label
+
+        path_shell, path_cell = self._create_soft_panel(parent, "panel_alt_2", inner_padding=(12, 10))
+        path_shell.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        tk.Label(
+            path_cell,
+            text="Chemin",
+            bg=self.colors["panel_alt_2"],
+            fg=self.colors["muted"],
+            font=self.fonts["ui_bold_small"],
+            anchor="w",
+            justify="left",
+        ).pack(anchor="w")
+        path_label = tk.Label(
+            path_cell,
+            textvariable=self.history_detail_vars["chemin"],
+            bg=self.colors["panel_alt_2"],
+            fg=self.colors["hero_subtle"],
+            font=self.fonts["ui_small"],
+            justify="left",
+            anchor="w",
+            wraplength=360,
+        )
+        path_label.pack(fill="x", pady=(6, 0))
+        self.history_detail_value_labels["chemin"] = path_label
 
     def _build_social_workspace(self, parent: tk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1622,6 +2295,7 @@ class SoraVideoApp(tk.Tk):
 
         header_shell, header_card = self._create_card(scroll_inner, inner_padding=(18, 18))
         header_shell.grid(row=0, column=0, sticky="ew")
+        self.social_layout["header_card"] = header_card
         header_card.columnconfigure(0, weight=1)
         title_wrap = tk.Frame(header_card, bg=self.colors["panel"])
         title_wrap.grid(row=0, column=0, sticky="w")
@@ -1642,16 +2316,18 @@ class SoraVideoApp(tk.Tk):
 
         action_wrap = tk.Frame(header_card, bg=self.colors["panel"])
         action_wrap.grid(row=0, column=1, sticky="e")
+        self.social_layout["action_wrap"] = action_wrap
         self.social_help_btn = ttk.Button(action_wrap, text="Aide", style="Secondary.TButton", command=self._show_social_help)
-        self.social_help_btn.pack(side="left")
         self.social_tiktok_portal_btn = ttk.Button(action_wrap, text="Portail TikTok", style="SmallGhost.TButton", command=lambda: self._open_url(TIKTOK_DEVELOPER_PORTAL_URL))
-        self.social_tiktok_portal_btn.pack(side="left", padx=(8, 0))
         self.social_facebook_portal_btn = ttk.Button(action_wrap, text="Portail Facebook", style="SmallGhost.TButton", command=lambda: self._open_url(FACEBOOK_DEVELOPER_PORTAL_URL))
-        self.social_facebook_portal_btn.pack(side="left", padx=(8, 0))
+        self.social_layout["help_btn"] = self.social_help_btn
+        self.social_layout["tiktok_btn"] = self.social_tiktok_portal_btn
+        self.social_layout["facebook_btn"] = self.social_facebook_portal_btn
+        self._layout_social_header_actions()
 
         status_shell, status_card = self._create_soft_panel(header_card, "panel_alt_2", inner_padding=(12, 10))
         status_shell.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        tk.Label(
+        social_status_label = tk.Label(
             status_card,
             textvariable=self.social_status_var,
             bg=self.colors["panel_alt_2"],
@@ -1660,16 +2336,20 @@ class SoraVideoApp(tk.Tk):
             justify="left",
             anchor="w",
             wraplength=980,
-        ).pack(fill="x")
+        )
+        social_status_label.pack(fill="x")
+        self.social_layout["status_label"] = social_status_label
 
         body = tk.Frame(scroll_inner, bg=self.colors["bg"])
         body.grid(row=1, column=0, sticky="nsew", pady=(18, 0))
         body.columnconfigure(0, weight=5)
         body.columnconfigure(1, weight=4)
+        self.social_layout["body"] = body
 
         accounts = tk.Frame(body, bg=self.colors["bg"])
         accounts.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
         accounts.columnconfigure(0, weight=1)
+        self.social_layout["accounts"] = accounts
 
         tiktok_shell, tiktok_card = self._create_card(accounts, inner_padding=(16, 16))
         tiktok_shell.grid(row=0, column=0, sticky="ew")
@@ -1686,7 +2366,9 @@ class SoraVideoApp(tk.Tk):
         tk.Label(tiktok_card, text="Client secret", bg=self.colors["panel"], fg=self.colors["muted"], font=self.fonts["ui_bold_small"]).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.tiktok_client_secret_entry = ttk.Entry(tiktok_card, textvariable=self.tiktok_client_secret_var, show="*")
         self.tiktok_client_secret_entry.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        tk.Label(tiktok_card, text="OAuth via navigateur puis retour automatique vers SoraStudio.", bg=self.colors["panel"], fg=self.colors["muted"], font=self.fonts["ui_small"], justify="left", wraplength=380).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        tiktok_hint_label = tk.Label(tiktok_card, text=self._build_tiktok_connect_hint_text(), bg=self.colors["panel"], fg=self.colors["muted"], font=self.fonts["ui_small"], justify="left", wraplength=380)
+        tiktok_hint_label.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.social_layout["tiktok_hint"] = tiktok_hint_label
         tiktok_actions = tk.Frame(tiktok_card, bg=self.colors["panel"])
         tiktok_actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         self.tiktok_save_btn = ttk.Button(tiktok_actions, text="Enregistrer", style="Ghost.TButton", command=self._save_tiktok_settings)
@@ -1730,6 +2412,7 @@ class SoraVideoApp(tk.Tk):
 
         publish_shell, publish_card = self._create_card(body, inner_padding=(16, 16))
         publish_shell.grid(row=0, column=1, sticky="nsew")
+        self.social_layout["publish_shell"] = publish_shell
         publish_card.columnconfigure(0, weight=1)
         publish_card.columnconfigure(1, weight=1)
         tk.Label(publish_card, text="Publier un rendu", bg=self.colors["panel"], fg=self.colors["ink"], font=self.fonts["section"]).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -1838,6 +2521,12 @@ class SoraVideoApp(tk.Tk):
     def _render_activity_feed(self) -> None:
         if self.feed_frame is None:
             return
+        message_wrap = self._available_wraplength(
+            self.feed_canvas,
+            760 if self.layout_mode == "regular" else 560,
+            padding=72,
+            minimum=260,
+        )
         for child in self.feed_frame.winfo_children():
             child.destroy()
 
@@ -1864,7 +2553,7 @@ class SoraVideoApp(tk.Tk):
                 fg=self.colors["muted"],
                 font=self.fonts["ui_small"],
                 justify="left",
-                wraplength=720,
+                wraplength=message_wrap,
             ).pack(anchor="w", pady=(8, 0))
             return
 
@@ -1905,7 +2594,7 @@ class SoraVideoApp(tk.Tk):
                 fg=self.colors["ink"] if item.get("kind") not in {"success", "warn", "error"} else fg,
                 font=self.fonts["ui_small"],
                 justify="left",
-                wraplength=760,
+                wraplength=message_wrap,
             ).pack(fill="x", pady=(10, 0))
         if self.feed_canvas is not None:
             self.after_idle(lambda: self.feed_canvas.yview_moveto(1.0))
@@ -1997,291 +2686,6 @@ class SoraVideoApp(tk.Tk):
             )
             canvas.create_image(image_x, image_y, image=logo, anchor="nw")
 
-    def _build_left_panel(self, parent: tk.Frame) -> None:
-        section_gap = int(self.metrics["section_gap"])
-
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
-
-        controls_row = tk.Frame(parent, bg=self.colors["panel"])
-        controls_row.grid(row=0, column=0, sticky="ew")
-        controls_row.columnconfigure(0, weight=3)
-        controls_row.columnconfigure(1, weight=1)
-        controls_row.columnconfigure(2, weight=1)
-
-        model_shell, model_card = self._create_soft_panel(
-            controls_row, "panel_alt_2", inner_padding=(12, 10)
-        )
-        model_shell.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        tk.Label(
-            model_card,
-            text="Modele",
-            bg=self.colors["panel_alt_2"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w", pady=(0, 8))
-        model_entry = ttk.Entry(model_card, textvariable=self.model_var)
-        model_entry.pack(fill="x")
-        self.controls.append(model_entry)
-
-        duration_shell, duration_card = self._create_soft_panel(
-            controls_row, "panel_alt_2", inner_padding=(12, 10)
-        )
-        duration_shell.grid(row=0, column=1, sticky="ew", padx=(0, 10))
-        tk.Label(
-            duration_card,
-            text="Duree (s)",
-            bg=self.colors["panel_alt_2"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w", pady=(0, 8))
-        seconds_combo = ttk.Combobox(
-            duration_card,
-            textvariable=self.seconds_var,
-            values=SECONDS_OPTIONS,
-            state="readonly",
-            style="Readable.TCombobox",
-            width=9,
-        )
-        seconds_combo.pack(fill="x")
-        self._bind_dropdown_open(seconds_combo)
-
-        size_shell, size_card = self._create_soft_panel(
-            controls_row, "panel_alt_2", inner_padding=(12, 10)
-        )
-        size_shell.grid(row=0, column=2, sticky="ew")
-        tk.Label(
-            size_card,
-            text="Format",
-            bg=self.colors["panel_alt_2"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w", pady=(0, 8))
-        size_combo = ttk.Combobox(
-            size_card,
-            textvariable=self.size_var,
-            values=SIZE_OPTIONS,
-            state="readonly",
-            style="Readable.TCombobox",
-        )
-        size_combo.pack(fill="x")
-        self._bind_dropdown_open(size_combo)
-        self.size_combo = size_combo
-        self.controls.extend([seconds_combo, size_combo])
-
-        social_shell, social_card = self._create_soft_panel(
-            parent, "panel_alt_2", inner_padding=(12, 10)
-        )
-        social_shell.grid(row=1, column=0, sticky="ew", pady=(section_gap, 0))
-        self.social_mode_check = tk.Checkbutton(
-            social_card,
-            text="Pour reseaux",
-            variable=self.social_mode_var,
-            command=self._apply_social_mode,
-            bg=self.colors["panel_alt_2"],
-            fg=self.colors["ink"],
-            selectcolor=self.colors["panel_alt"],
-            activebackground=self.colors["panel_alt_2"],
-            activeforeground=self.colors["ink"],
-            font=self.fonts["ui_bold_small"],
-            highlightthickness=0,
-            bd=0,
-        )
-        self.social_mode_check.pack(anchor="w")
-        tk.Label(
-            social_card,
-            textvariable=self.social_note_var,
-            bg=self.colors["panel_alt_2"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_small"],
-            wraplength=620,
-            justify="left",
-        ).pack(anchor="w", pady=(6, 0))
-        self.controls.append(self.social_mode_check)
-
-        prompt_section = tk.Frame(parent, bg=self.colors["panel"])
-        prompt_section.grid(row=2, column=0, sticky="nsew", pady=(section_gap, 0))
-        prompt_section.columnconfigure(0, weight=1)
-        prompt_section.rowconfigure(1, weight=1)
-
-        prompt_header = tk.Frame(prompt_section, bg=self.colors["panel"])
-        prompt_header.grid(row=0, column=0, sticky="ew")
-        prompt_header.columnconfigure(0, weight=1)
-        ttk.Label(prompt_header, text="Prompt", style="SectionTitle.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        prompt_border = tk.Frame(prompt_section, bg=self.colors["input_border"], bd=0, padx=1, pady=1)
-        prompt_border.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-        prompt_border.columnconfigure(0, weight=1)
-        prompt_border.rowconfigure(0, weight=1)
-
-        self.prompt_text = tk.Text(
-            prompt_border,
-            height=9,
-            font=self.fonts["ui"],
-            wrap="word",
-            bg=self.colors["input_bg"],
-            fg=self.colors["ink"],
-            insertbackground=self.colors["ink"],
-            relief="flat",
-            bd=0,
-            padx=14,
-            pady=14,
-            highlightthickness=0,
-        )
-        self.prompt_text.grid(row=0, column=0, sticky="nsew")
-        self.prompt_text.insert("1.0", DEFAULT_PROMPT)
-        self.controls.append(self.prompt_text)
-
-        output_shell, output_card = self._create_soft_panel(
-            parent, "panel_tint", inner_padding=(14, 14)
-        )
-        output_shell.grid(row=3, column=0, sticky="ew", pady=(section_gap, 0))
-        tk.Label(
-            output_card,
-            text="Sortie",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["ink"],
-            font=self.fonts["section"],
-        ).pack(anchor="w", pady=(2, 12))
-
-        tk.Label(
-            output_card,
-            text="Nom de la video",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w")
-        name_wrap = tk.Frame(output_card, bg=self.colors["panel_tint"])
-        name_wrap.pack(fill="x", pady=(6, 10))
-        name_wrap.columnconfigure(0, weight=1)
-        name_entry = ttk.Entry(name_wrap, textvariable=self.video_name_var)
-        name_entry.grid(row=0, column=0, sticky="ew")
-        name_hint = tk.Label(
-            name_wrap,
-            text=".MP4",
-            bg=self.colors["accent_soft_2"],
-            fg=self.colors["accent"],
-            font=self.fonts["ui_bold_small"],
-            padx=10,
-            pady=6,
-        )
-        name_hint.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self.controls.append(name_entry)
-
-        tk.Label(
-            output_card,
-            text="Fichier de sortie",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w")
-        output_wrap = tk.Frame(output_card, bg=self.colors["panel_tint"])
-        output_wrap.pack(fill="x", pady=(6, 0))
-        output_wrap.columnconfigure(0, weight=1)
-        output_entry = ttk.Entry(output_wrap, textvariable=self.output_var)
-        output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        browse_btn = ttk.Button(
-            output_wrap,
-            text="Parcourir",
-            style="Secondary.TButton",
-            command=self._pick_output,
-        )
-        browse_btn.grid(row=0, column=1, sticky="e")
-        self.controls.extend([output_entry, browse_btn])
-
-        action_wrap = tk.Frame(parent, bg=self.colors["panel"])
-        action_wrap.grid(row=4, column=0, sticky="ew", pady=(section_gap, 0))
-        action_wrap.columnconfigure(0, weight=3)
-        action_wrap.columnconfigure(1, weight=2)
-
-        self.generate_btn = ttk.Button(
-            action_wrap,
-            text="Generer la video",
-            style="Primary.TButton",
-            command=self._start_generation,
-        )
-        self.generate_btn.grid(row=0, column=0, sticky="ew")
-
-        self.reset_btn = ttk.Button(
-            action_wrap,
-            text="Reinitialiser",
-            style="Secondary.TButton",
-            command=self._reset_form,
-        )
-        self.reset_btn.grid(row=0, column=1, sticky="ew", padx=(10, 0))
-
-        self.controls.extend([self.generate_btn, self.reset_btn])
-
-    def _build_status_panel(self, parent: tk.Frame) -> None:
-        header = tk.Frame(parent, bg=self.colors["panel"])
-        header.pack(fill="x")
-        header.columnconfigure(0, weight=1)
-
-        ttk.Label(header, text="Production Live", style="SectionTitle.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        self.status_chip = tk.Label(
-            header,
-            text="PRET",
-            bg=self.colors["info"],
-            fg=self.colors["info_text"],
-            font=self.fonts["ui_bold_small"],
-            padx=10,
-            pady=4,
-            bd=0,
-        )
-        self.status_chip.grid(row=0, column=1, sticky="e")
-
-        status_copy = tk.Label(
-            parent,
-            textvariable=self.status_var,
-            bg=self.colors["panel"],
-            fg=self.colors["ink"],
-            font=self.fonts["ui_bold"],
-            anchor="w",
-        )
-        status_copy.pack(fill="x", pady=(14, 10))
-
-        progress_shell, progress_card = self._create_soft_panel(
-            parent, "panel_tint", inner_padding=(12, 12)
-        )
-        progress_shell.pack(fill="x")
-        tk.Label(
-            progress_card,
-            text="Progression",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=0, column=0, sticky="w")
-        tk.Label(
-            progress_card,
-            textvariable=self.progress_text_var,
-            bg=self.colors["panel_tint"],
-            fg=self.colors["accent"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=0, column=1, sticky="e")
-        progress_card.columnconfigure(0, weight=1)
-
-        self.progress = ttk.Progressbar(
-            progress_card,
-            style="Blue.Horizontal.TProgressbar",
-            mode="determinate",
-            variable=self.progress_var,
-            maximum=100,
-        )
-        self.progress.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-
-        metrics = tk.Frame(parent, bg=self.colors["panel"])
-        metrics.pack(fill="x", pady=(14, 0))
-        metrics.columnconfigure(0, weight=1)
-        metrics.columnconfigure(1, weight=1)
-
-        self._make_metric(metrics, 0, 0, "Modele", self.preview_model_var)
-        self._make_metric(metrics, 0, 1, "Duree", self.preview_seconds_var)
-        self._make_metric(metrics, 1, 0, "Format", self.preview_size_var)
-        self._make_metric(metrics, 1, 1, "Sortie", self.preview_output_var)
-
     def _make_metric(
         self,
         parent: tk.Frame,
@@ -2322,645 +2726,6 @@ class SoraVideoApp(tk.Tk):
             fg=self.colors["ink"],
             font=self.fonts["ui_bold"],
         ).pack(anchor="w", pady=(6, 0))
-
-    def _build_log_panel(self, parent: tk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
-
-        log_header = tk.Frame(parent, bg=self.colors["panel"], padx=14, pady=12)
-        log_header.grid(row=0, column=0, sticky="ew")
-        log_header.columnconfigure(0, weight=1)
-
-        ttk.Label(log_header, text="Journal", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        self.clear_log_btn = ttk.Button(
-            log_header,
-            text="Vider",
-            style="SmallGhost.TButton",
-            command=self._clear_log,
-        )
-        self.clear_log_btn.grid(row=0, column=1, sticky="ne")
-
-        log_wrap = tk.Frame(
-            parent,
-            bg=self.colors["panel_alt"],
-            padx=12,
-            pady=12,
-            highlightthickness=1,
-            highlightbackground=self.colors["panel_border"],
-        )
-        log_wrap.grid(row=1, column=0, sticky="nsew")
-        log_wrap.columnconfigure(0, weight=1)
-        log_wrap.rowconfigure(0, weight=1)
-
-        self.log_text = tk.Text(
-            log_wrap,
-            height=14,
-            font=self.fonts["mono"],
-            wrap="word",
-            bg=self.colors["log_bg"],
-            fg=self.colors["log_info"],
-            insertbackground=self.colors["log_info"],
-            relief="flat",
-            bd=0,
-            padx=10,
-            pady=10,
-            highlightthickness=0,
-        )
-        self.log_text.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-
-        scroll = ttk.Scrollbar(
-            log_wrap,
-            orient="vertical",
-            command=self.log_text.yview,
-            style="App.Vertical.TScrollbar",
-        )
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scroll.set)
-
-        self.log_text.tag_configure("info", foreground=self.colors["log_info"])
-        self.log_text.tag_configure("success", foreground=self.colors["log_success"])
-        self.log_text.tag_configure("warn", foreground=self.colors["log_warn"])
-        self.log_text.tag_configure("error", foreground=self.colors["log_error"])
-        self.log_text.tag_configure("system", foreground=self.colors["log_system"])
-        self.log_text.configure(state="disabled")
-
-    def _build_history_tab(self, parent: tk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
-
-        shell, card = self._create_card(parent, inner_padding=self.metrics["history_padding"])
-        shell.grid(row=0, column=0, sticky="nsew")
-        card.columnconfigure(0, weight=1)
-        card.rowconfigure(2, weight=1)
-
-        top = tk.Frame(card, bg=self.colors["panel"])
-        top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(0, weight=1)
-
-        ttk.Label(top, text="Mes videos", style="SectionTitle.TLabel").grid(row=0, column=0, sticky="w")
-        tk.Label(
-            top,
-            textvariable=self.history_count_var,
-            bg=self.colors["accent_soft_2"],
-            fg=self.colors["accent"],
-            font=self.fonts["ui_bold_small"],
-            padx=10,
-            pady=5,
-        ).grid(row=0, column=1, sticky="ne")
-
-        actions = tk.Frame(card, bg=self.colors["panel"])
-        actions.grid(row=1, column=0, sticky="ew", pady=(12, 12))
-        ttk.Button(
-            actions,
-            text="Rafraichir",
-            style="Ghost.TButton",
-            command=self._history_refresh,
-        ).pack(side="left")
-        self.history_open_btn = ttk.Button(
-            actions,
-            text="Visualiser",
-            style="Secondary.TButton",
-            command=self._history_open_selected,
-        )
-        self.history_open_btn.pack(side="left", padx=(8, 0))
-        self.history_export_btn = ttk.Button(
-            actions,
-            text="Exporter",
-            style="Secondary.TButton",
-            command=self._history_export_selected,
-        )
-        self.history_export_btn.pack(side="left", padx=(8, 0))
-        self.history_delete_btn = ttk.Button(
-            actions,
-            text="Supprimer",
-            style="Danger.TButton",
-            command=self._history_delete_selected,
-        )
-        self.history_delete_btn.pack(side="left", padx=(8, 0))
-
-        table_wrap = tk.Frame(card, bg=self.colors["panel_alt"], padx=12, pady=12)
-        table_wrap.grid(row=2, column=0, sticky="nsew")
-        table_wrap.columnconfigure(0, weight=1)
-        table_wrap.rowconfigure(0, weight=1)
-
-        table_border = tk.Frame(
-            table_wrap,
-            bg=self.colors["panel"],
-            highlightthickness=1,
-            highlightbackground=self.colors["panel_border"],
-        )
-        table_border.grid(row=0, column=0, sticky="nsew")
-        table_border.columnconfigure(0, weight=1)
-        table_border.rowconfigure(0, weight=1)
-
-        columns = ("name", "date", "duration", "resolution", "model", "size")
-        self.history_tree = ttk.Treeview(
-            table_border,
-            columns=columns,
-            show="headings",
-            style="History.Treeview",
-            selectmode="browse",
-        )
-        self.history_tree.grid(row=0, column=0, sticky="nsew")
-
-        self.history_tree.heading("name", text="Nom")
-        self.history_tree.heading("date", text="Date")
-        self.history_tree.heading("duration", text="Duree")
-        self.history_tree.heading("resolution", text="Format")
-        self.history_tree.heading("model", text="Modele")
-        self.history_tree.heading("size", text="Taille")
-
-        self.history_tree.column("name", width=240, minwidth=180, anchor="w")
-        self.history_tree.column("date", width=145, minwidth=120, anchor="center")
-        self.history_tree.column("duration", width=82, minwidth=70, anchor="center")
-        self.history_tree.column("resolution", width=110, minwidth=90, anchor="center")
-        self.history_tree.column("model", width=120, minwidth=100, anchor="center")
-        self.history_tree.column("size", width=95, minwidth=80, anchor="e")
-
-        history_scroll = ttk.Scrollbar(
-            table_border,
-            orient="vertical",
-            command=self.history_tree.yview,
-            style="App.Vertical.TScrollbar",
-        )
-        history_scroll.grid(row=0, column=1, sticky="ns")
-        self.history_tree.configure(yscrollcommand=history_scroll.set)
-
-        self.history_tree.bind("<<TreeviewSelect>>", self._on_history_select)
-        self.history_tree.bind("<Double-1>", lambda _event: self._history_open_selected())
-
-        details_shell, details_card = self._create_soft_panel(
-            card, "panel_alt", inner_padding=(14, 12)
-        )
-        details_shell.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        tk.Label(
-            details_card,
-            text="Selection",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).pack(anchor="w")
-        tk.Message(
-            details_card,
-            textvariable=self.history_details_var,
-            bg=self.colors["panel_alt"],
-            fg=self.colors["ink"],
-            font=self.fonts["ui_small"],
-            width=760,
-            justify="left",
-        ).pack(fill="x", pady=(6, 0))
-
-    def _build_social_tab(self, parent: tk.Frame) -> None:
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
-        scroll_wrap = tk.Frame(parent, bg=self.colors["bg"])
-        scroll_wrap.grid(row=0, column=0, sticky="nsew")
-        scroll_wrap.columnconfigure(0, weight=1)
-        scroll_wrap.rowconfigure(0, weight=1)
-
-        self.social_scroll_canvas = tk.Canvas(
-            scroll_wrap,
-            bg=self.colors["bg"],
-            relief="flat",
-            bd=0,
-            highlightthickness=0,
-        )
-        self.social_scroll_canvas.grid(row=0, column=0, sticky="nsew")
-        outer_scroll = ttk.Scrollbar(
-            scroll_wrap,
-            orient="vertical",
-            command=self.social_scroll_canvas.yview,
-            style="App.Vertical.TScrollbar",
-        )
-        outer_scroll.grid(row=0, column=1, sticky="ns")
-        self.social_scroll_canvas.configure(yscrollcommand=outer_scroll.set)
-
-        self.social_scroll_frame = tk.Frame(self.social_scroll_canvas, bg=self.colors["bg"])
-        self.social_scroll_window_id = self.social_scroll_canvas.create_window(
-            (0, 0), window=self.social_scroll_frame, anchor="nw"
-        )
-        self.social_scroll_frame.columnconfigure(0, weight=1)
-        self.social_scroll_frame.bind("<Configure>", self._on_social_frame_configure)
-        self.social_scroll_canvas.bind("<Configure>", self._on_social_canvas_configure)
-        self.social_scroll_canvas.bind("<Enter>", self._bind_social_mousewheel)
-        self.social_scroll_canvas.bind("<Leave>", self._unbind_social_mousewheel)
-
-        shell, card = self._create_card(self.social_scroll_frame, inner_padding=(10, 8))
-        shell.grid(row=0, column=0, sticky="ew")
-        card.columnconfigure(0, weight=1)
-
-        top = tk.Frame(card, bg=self.colors["panel"])
-        top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(0, weight=1)
-        title_wrap = tk.Frame(top, bg=self.colors["panel"])
-        title_wrap.grid(row=0, column=0, sticky="w")
-        ttk.Label(title_wrap, text="Reseaux sociaux", style="SectionTitle.TLabel").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(
-            title_wrap,
-            text="TikTok + Facebook Reels",
-            style="SectionNote.TLabel",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-
-        action_wrap = tk.Frame(top, bg=self.colors["panel"])
-        action_wrap.grid(row=0, column=1, rowspan=2, sticky="e")
-        self.social_help_btn = ttk.Button(
-            action_wrap,
-            text="Aide",
-            style="Secondary.TButton",
-            command=self._show_social_help,
-        )
-        self.social_help_btn.pack(side="left")
-        self.social_tiktok_portal_btn = ttk.Button(
-            action_wrap,
-            text="Portail TikTok",
-            style="SmallGhost.TButton",
-            command=lambda: self._open_url(TIKTOK_DEVELOPER_PORTAL_URL),
-        )
-        self.social_tiktok_portal_btn.pack(side="left", padx=(8, 0))
-        self.social_facebook_portal_btn = ttk.Button(
-            action_wrap,
-            text="Portail Facebook",
-            style="SmallGhost.TButton",
-            command=lambda: self._open_url(FACEBOOK_DEVELOPER_PORTAL_URL),
-        )
-        self.social_facebook_portal_btn.pack(side="left", padx=(8, 0))
-
-        status_shell, status_card = self._create_soft_panel(card, "panel_alt_2", inner_padding=(10, 8))
-        status_shell.grid(row=1, column=0, sticky="ew", pady=(8, 8))
-        tk.Label(
-            status_card,
-            textvariable=self.social_status_var,
-            bg=self.colors["panel_alt_2"],
-            fg=self.colors["ink"],
-            font=self.fonts["ui_small"],
-            justify="left",
-            anchor="w",
-            wraplength=860,
-        ).pack(fill="x")
-
-        body = tk.Frame(card, bg=self.colors["panel"])
-        body.grid(row=2, column=0, sticky="ew")
-        body.columnconfigure(0, weight=5)
-        body.columnconfigure(1, weight=4)
-        body.rowconfigure(0, weight=1)
-
-        accounts = tk.Frame(body, bg=self.colors["panel"])
-        accounts.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        accounts.columnconfigure(0, weight=1)
-
-        tiktok_shell, tiktok_card = self._create_soft_panel(accounts, "panel_alt", inner_padding=(10, 10))
-        tiktok_shell.grid(row=0, column=0, sticky="ew")
-        tiktok_card.columnconfigure(0, weight=4)
-        tiktok_card.columnconfigure(1, weight=2)
-        tk.Label(
-            tiktok_card,
-            text="TikTok",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["ink"],
-            font=self.fonts["section"],
-        ).grid(row=0, column=0, sticky="w")
-        tk.Label(
-            tiktok_card,
-            textvariable=self.tiktok_account_var,
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_small"],
-            justify="left",
-            anchor="w",
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 6))
-        tk.Label(
-            tiktok_card,
-            text="Client key",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=2, column=0, sticky="w")
-        tk.Label(
-            tiktok_card,
-            text="Redirect port",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=2, column=1, sticky="w", padx=(10, 0))
-        self.tiktok_client_key_entry = ttk.Entry(tiktok_card, textvariable=self.tiktok_client_key_var)
-        self.tiktok_client_key_entry.grid(row=3, column=0, sticky="ew", pady=(4, 0))
-        self.tiktok_redirect_port_entry = ttk.Entry(
-            tiktok_card, textvariable=self.tiktok_redirect_port_var, width=10
-        )
-        self.tiktok_redirect_port_entry.grid(row=3, column=1, sticky="ew", pady=(4, 0), padx=(10, 0))
-        tk.Label(
-            tiktok_card,
-            text="Client secret",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.tiktok_client_secret_entry = ttk.Entry(
-            tiktok_card,
-            textvariable=self.tiktok_client_secret_var,
-            show="*",
-        )
-        self.tiktok_client_secret_entry.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        tk.Label(
-            tiktok_card,
-            text="OAuth via navigateur: enregistre les champs, puis clique sur Connecter.",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_small"],
-            justify="left",
-            wraplength=340,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        tiktok_actions = tk.Frame(tiktok_card, bg=self.colors["panel_alt"])
-        tiktok_actions.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.tiktok_save_btn = ttk.Button(
-            tiktok_actions,
-            text="Enregistrer",
-            style="Ghost.TButton",
-            command=self._save_tiktok_settings,
-        )
-        self.tiktok_save_btn.pack(side="left")
-        self.tiktok_connect_btn = ttk.Button(
-            tiktok_actions,
-            text="Connecter",
-            style="Secondary.TButton",
-            command=self._connect_tiktok,
-        )
-        self.tiktok_connect_btn.pack(side="left", padx=(8, 0))
-        self.tiktok_disconnect_btn = ttk.Button(
-            tiktok_actions,
-            text="Deconnecter",
-            style="Ghost.TButton",
-            command=self._disconnect_tiktok,
-        )
-        self.tiktok_disconnect_btn.pack(side="left", padx=(8, 0))
-
-        facebook_shell, facebook_card = self._create_soft_panel(
-            accounts, "panel_alt", inner_padding=(10, 10)
-        )
-        facebook_shell.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        facebook_card.columnconfigure(0, weight=4)
-        facebook_card.columnconfigure(1, weight=2)
-        tk.Label(
-            facebook_card,
-            text="Facebook Page",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["ink"],
-            font=self.fonts["section"],
-        ).grid(row=0, column=0, sticky="w")
-        tk.Label(
-            facebook_card,
-            textvariable=self.facebook_account_var,
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_small"],
-            justify="left",
-            anchor="w",
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 6))
-        tk.Label(
-            facebook_card,
-            text="App ID",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=2, column=0, sticky="w")
-        tk.Label(
-            facebook_card,
-            text="Redirect port",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=2, column=1, sticky="w", padx=(10, 0))
-        self.facebook_app_id_entry = ttk.Entry(facebook_card, textvariable=self.facebook_app_id_var)
-        self.facebook_app_id_entry.grid(row=3, column=0, sticky="ew", pady=(4, 0))
-        self.facebook_redirect_port_entry = ttk.Entry(
-            facebook_card, textvariable=self.facebook_redirect_port_var, width=10
-        )
-        self.facebook_redirect_port_entry.grid(row=3, column=1, sticky="ew", pady=(4, 0), padx=(10, 0))
-        tk.Label(
-            facebook_card,
-            text="App secret",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=4, column=0, sticky="w", pady=(6, 0))
-        tk.Label(
-            facebook_card,
-            text="Graph version",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=4, column=1, sticky="w", pady=(6, 0), padx=(10, 0))
-        self.facebook_app_secret_entry = ttk.Entry(
-            facebook_card,
-            textvariable=self.facebook_app_secret_var,
-            show="*",
-        )
-        self.facebook_app_secret_entry.grid(row=5, column=0, sticky="ew", pady=(4, 0))
-        self.facebook_graph_version_entry = ttk.Entry(
-            facebook_card,
-            textvariable=self.facebook_graph_version_var,
-        )
-        self.facebook_graph_version_entry.grid(row=5, column=1, sticky="ew", pady=(4, 0), padx=(10, 0))
-        tk.Label(
-            facebook_card,
-            text="Page active",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.facebook_page_combo = ttk.Combobox(
-            facebook_card,
-            textvariable=self.facebook_page_var,
-            values=(),
-            state="disabled",
-            style="Readable.TCombobox",
-        )
-        self.facebook_page_combo.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        self.facebook_page_combo.bind("<<ComboboxSelected>>", self._on_facebook_page_change)
-        self._bind_dropdown_open(self.facebook_page_combo)
-        facebook_actions = tk.Frame(facebook_card, bg=self.colors["panel_alt"])
-        facebook_actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.facebook_save_btn = ttk.Button(
-            facebook_actions,
-            text="Enregistrer",
-            style="Ghost.TButton",
-            command=self._save_facebook_settings,
-        )
-        self.facebook_save_btn.pack(side="left")
-        self.facebook_connect_btn = ttk.Button(
-            facebook_actions,
-            text="Connecter",
-            style="Secondary.TButton",
-            command=self._connect_facebook,
-        )
-        self.facebook_connect_btn.pack(side="left", padx=(8, 0))
-        self.facebook_disconnect_btn = ttk.Button(
-            facebook_actions,
-            text="Deconnecter",
-            style="Ghost.TButton",
-            command=self._disconnect_facebook,
-        )
-        self.facebook_disconnect_btn.pack(side="left", padx=(8, 0))
-
-        publish_shell, publish_card = self._create_soft_panel(body, "panel_tint", inner_padding=(10, 10))
-        publish_shell.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        publish_card.columnconfigure(0, weight=1)
-        publish_card.columnconfigure(1, weight=1)
-        tk.Label(
-            publish_card,
-            text="Publication",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["ink"],
-            font=self.fonts["section"],
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
-
-        tk.Label(
-            publish_card,
-            text="Video source",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.social_video_combo = ttk.Combobox(
-            publish_card,
-            textvariable=self.social_video_var,
-            values=(),
-            state="readonly",
-            style="Readable.TCombobox",
-        )
-        self.social_video_combo.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        self.social_video_combo.bind("<<ComboboxSelected>>", self._on_social_video_change)
-        self._bind_dropdown_open(self.social_video_combo)
-
-        tk.Label(
-            publish_card,
-            text="Legende",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
-        self.social_caption_entry = ttk.Entry(publish_card, textvariable=self.social_caption_var)
-        self.social_caption_entry.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-
-        tk.Label(
-            publish_card,
-            text="Cibles",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=5, column=0, sticky="w", pady=(6, 0))
-        targets = tk.Frame(publish_card, bg=self.colors["panel_tint"])
-        targets.grid(row=6, column=0, sticky="w", pady=(4, 0))
-        self.social_tiktok_check = self._build_social_target_check(targets, "TikTok", self.social_tiktok_var)
-        self.social_tiktok_check.pack(side="left")
-        self.social_facebook_check = self._build_social_target_check(
-            targets, "Facebook Page", self.social_facebook_var
-        )
-        self.social_facebook_check.pack(side="left", padx=(12, 0))
-
-        tk.Label(
-            publish_card,
-            text="Confidentialite TikTok",
-            bg=self.colors["panel_tint"],
-            fg=self.colors["muted"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=5, column=1, sticky="w", pady=(6, 0), padx=(10, 0))
-        self.tiktok_privacy_combo = ttk.Combobox(
-            publish_card,
-            textvariable=self.tiktok_privacy_var,
-            values=(),
-            state="disabled",
-            style="Readable.TCombobox",
-        )
-        self.tiktok_privacy_combo.grid(row=6, column=1, sticky="ew", pady=(4, 0), padx=(10, 0))
-        self._bind_dropdown_open(self.tiktok_privacy_combo)
-
-        self.social_publish_btn = ttk.Button(
-            publish_card,
-            text="Publier la video",
-            style="Primary.TButton",
-            command=self._publish_selected_social,
-        )
-        self.social_publish_btn.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-
-        posts_shell, posts_card = self._create_soft_panel(card, "panel_alt", inner_padding=(8, 8))
-        posts_shell.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        posts_card.columnconfigure(0, weight=1)
-        posts_card.rowconfigure(1, weight=1)
-        tk.Label(
-            posts_card,
-            text="Historique de publication",
-            bg=self.colors["panel_alt"],
-            fg=self.colors["ink"],
-            font=self.fonts["ui_bold_small"],
-        ).grid(row=0, column=0, sticky="w")
-        posts_border = tk.Frame(
-            posts_card,
-            bg=self.colors["panel"],
-            highlightthickness=1,
-            highlightbackground=self.colors["panel_border"],
-        )
-        posts_border.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        posts_border.columnconfigure(0, weight=1)
-        posts_border.rowconfigure(0, weight=1)
-        columns = ("video", "platform", "target", "status", "date")
-        self.social_posts_tree = ttk.Treeview(
-            posts_border,
-            columns=columns,
-            show="headings",
-            style="History.Treeview",
-            selectmode="browse",
-            height=3,
-        )
-        self.social_posts_tree.grid(row=0, column=0, sticky="nsew")
-        self.social_posts_tree.heading("video", text="Video")
-        self.social_posts_tree.heading("platform", text="Plateforme")
-        self.social_posts_tree.heading("target", text="Cible")
-        self.social_posts_tree.heading("status", text="Etat")
-        self.social_posts_tree.heading("date", text="Date")
-        self.social_posts_tree.column("video", width=220, minwidth=180, anchor="w")
-        self.social_posts_tree.column("platform", width=110, minwidth=100, anchor="center")
-        self.social_posts_tree.column("target", width=180, minwidth=140, anchor="w")
-        self.social_posts_tree.column("status", width=110, minwidth=90, anchor="center")
-        self.social_posts_tree.column("date", width=150, minwidth=130, anchor="center")
-        posts_scroll = ttk.Scrollbar(
-            posts_border,
-            orient="vertical",
-            command=self.social_posts_tree.yview,
-            style="App.Vertical.TScrollbar",
-        )
-        posts_scroll.grid(row=0, column=1, sticky="ns")
-        self.social_posts_tree.configure(yscrollcommand=posts_scroll.set)
-
-    def _on_social_frame_configure(self, _event: Any = None) -> None:
-        if self.social_scroll_canvas is None:
-            return
-        self.social_scroll_canvas.configure(scrollregion=self.social_scroll_canvas.bbox("all"))
-
-    def _on_social_canvas_configure(self, event: Any) -> None:
-        if self.social_scroll_canvas is None or self.social_scroll_window_id is None:
-            return
-        self.social_scroll_canvas.itemconfigure(self.social_scroll_window_id, width=event.width)
-
-    def _bind_social_mousewheel(self, _event: Any = None) -> None:
-        if self.social_scroll_binding_active:
-            return
-        self.social_scroll_binding_active = True
-        self.bind_all("<MouseWheel>", self._on_social_mousewheel)
-
-    def _unbind_social_mousewheel(self, _event: Any = None) -> None:
-        if not self.social_scroll_binding_active:
-            return
-        self.social_scroll_binding_active = False
-        self.unbind_all("<MouseWheel>")
-
-    def _on_social_mousewheel(self, event: Any) -> None:
-        if self.social_scroll_canvas is None:
-            return
-        delta = int(-1 * (event.delta / 120))
-        self.social_scroll_canvas.yview_scroll(delta, "units")
 
     def _build_social_target_check(
         self, parent: tk.Frame, text: str, variable: tk.BooleanVar
@@ -3078,6 +2843,12 @@ class SoraVideoApp(tk.Tk):
     def _refresh_social_posts_view(self) -> None:
         if self.social_posts_list_frame is None:
             return
+        wrap = self._available_wraplength(
+            self.social_posts_list_frame,
+            760 if self.layout_mode == "regular" else 620,
+            padding=56,
+            minimum=240,
+        )
         for child in self.social_posts_list_frame.winfo_children():
             child.destroy()
 
@@ -3090,7 +2861,7 @@ class SoraVideoApp(tk.Tk):
                 fg=self.colors["muted"],
                 font=self.fonts["ui_small"],
                 justify="left",
-                wraplength=760,
+                wraplength=wrap,
             ).pack(fill="x", padx=8, pady=8)
             return
 
@@ -3118,7 +2889,7 @@ class SoraVideoApp(tk.Tk):
                 fg=self.colors["ink"],
                 font=self.fonts["ui_small"],
                 justify="left",
-                wraplength=760,
+                wraplength=wrap,
             ).pack(fill="x", pady=(6, 0))
             tk.Label(
                 card,
@@ -3276,12 +3047,84 @@ class SoraVideoApp(tk.Tk):
         port = self._normalize_port_value(self.facebook_redirect_port_var.get().strip(), "8766")
         return f"http://127.0.0.1:{port}/facebook/callback"
 
+    def _build_tiktok_connect_hint_text(self) -> str:
+        return (
+            "Desktop Login Kit TikTok: enregistre exactement "
+            f"{self._format_tiktok_callback_url()} dans le portail, puis clique sur Connecter."
+        )
+
+    def _build_tiktok_guided_config_message(self, missing_label: str) -> str:
+        return (
+            f"Renseigne d'abord {missing_label} dans la section Configuration TikTok ou clique sur Aide.\n\n"
+            "Cette integration utilise TikTok Desktop Login Kit, pas Web Login Kit.\n"
+            "Redirect URI a enregistrer exactement :\n"
+            f"{self._format_tiktok_callback_url()}\n\n"
+            "Si le portail TikTok refuse cette URI et n'accepte que https://, reconfigure l'application en mode "
+            "Desktop ou cree une nouvelle app Desktop."
+        )
+
+    def _build_tiktok_connect_error_message(self, message: str) -> str:
+        raw = str(message or "").strip()
+        lowered = raw.lower()
+        callback_url = self._format_tiktok_callback_url()
+        if (
+            "connexion annulee ou expiree avant retour oauth" in lowered
+            or "code oauth tiktok manquant" in lowered
+            or "etat oauth tiktok invalide" in lowered
+        ):
+            return (
+                "TikTok n'a pas renvoye le navigateur vers SoraStudio.\n\n"
+                "Verifie d'abord que l'application TikTok est configuree en Desktop Login Kit, pas en Web Login Kit.\n"
+                "Redirect URI a enregistrer exactement :\n"
+                f"{callback_url}\n\n"
+                "Si le portail n'accepte que https://, recree ou reconfigure l'application en mode Desktop.\n"
+                "Ajoute aussi le compte TikTok de test dans le Sandbox avant de relancer Connecter."
+            )
+        if "client_key" in lowered or "redirect_uri" in lowered:
+            return (
+                "TikTok a rejete la requete OAuth.\n\n"
+                "Verifie que le Client key provient bien d'une application TikTok Desktop avec Login Kit et "
+                "Content Posting API actives.\n"
+                "Redirect URI a enregistrer exactement :\n"
+                f"{callback_url}"
+            )
+        return raw
+
+    def _build_social_help_text(self) -> str:
+        return (
+            "TikTok Desktop\n"
+            "1. Va sur le portail TikTok Developers puis cree ou reconfigure une application Desktop.\n"
+            "2. Active Login Kit et Content Posting API avec Direct Post.\n"
+            "3. Dans Login Kit Desktop, enregistre exactement cette Redirect URI :\n"
+            f"   {self._format_tiktok_callback_url()}\n"
+            "4. Si le portail refuse cette URI et exige https://, l'application est configuree en mode Web : "
+            "reviens sur une app Desktop Login Kit.\n"
+            "5. Ajoute ton compte TikTok de test comme target user Sandbox avant les essais.\n"
+            "6. Renseigne Client key, Client secret et Redirect port dans l'application, puis clique sur Enregistrer.\n"
+            "7. Clique sur Connecter : le navigateur s'ouvre, tu te connectes a TikTok, puis tu autorises "
+            "l'application.\n"
+            "8. TikTok revient automatiquement vers SoraStudio pour finaliser l'authentification.\n"
+            "9. Avant toute mise en production, rotate le Client secret expose pendant les tests.\n\n"
+            "Facebook Page\n"
+            "1. Va sur le portail Meta for Developers puis cree une application.\n"
+            "2. Recupere App ID et App secret.\n"
+            "3. Dans Facebook Login / Valid OAuth Redirect URIs, ajoute :\n"
+            f"   {self._format_facebook_callback_url()}\n"
+            "4. Renseigne App ID, App secret, Graph version et Redirect port dans l'application, puis clique sur "
+            "Enregistrer.\n"
+            "5. Clique sur Connecter : le navigateur s'ouvre, tu te connectes a Facebook puis tu selectionnes ta "
+            "Page.\n\n"
+            "Champs a remplir dans l'application\n"
+            "- TikTok : Client key, Client secret, Redirect port\n"
+            "- Facebook : App ID, App secret, Graph version, Redirect port\n\n"
+            "Publication\n"
+            "- Une fois connecte, coche la ou les cibles, choisis une video compatible et clique sur Publier la video.\n"
+            "- Pour de meilleurs resultats, genere les videos avec la case Pour reseaux activee dans l'ecran Creer.\n"
+        )
+
     def _show_guided_config_error(self, platform: str, missing_label: str) -> None:
         if platform == "tiktok":
-            message = (
-                f"Renseigne d'abord {missing_label} dans la section Configuration TikTok ou clique sur Aide.\n\n"
-                f"Redirect URI a enregistrer :\n{self._format_tiktok_callback_url()}"
-            )
+            message = self._build_tiktok_guided_config_message(missing_label)
             title = "Config TikTok"
         else:
             message = (
@@ -3425,32 +3268,7 @@ class SoraVideoApp(tk.Tk):
         )
         scroll.grid(row=0, column=1, sticky="ns")
         help_text.configure(yscrollcommand=scroll.set)
-        help_text.insert(
-            "1.0",
-            (
-                "TikTok\n"
-                "1. Va sur le portail TikTok Developers puis cree une application.\n"
-                "2. Dans l'app, recupere Client key et Client secret.\n"
-                "3. Dans la configuration de ton app TikTok, ajoute cette Redirect URI :\n"
-                f"   {self._format_tiktok_callback_url()}\n"
-                "4. Renseigne Client key, Client secret et Redirect port dans l'application, puis clique sur Enregistrer.\n"
-                "5. Clique sur Connecter : le navigateur s'ouvre, tu te connectes a TikTok, puis tu autorises l'application.\n"
-                "6. TikTok revient automatiquement vers SoraStudio pour finaliser l'authentification.\n\n"
-                "Facebook Page\n"
-                "1. Va sur le portail Meta for Developers puis cree une application.\n"
-                "2. Recupere App ID et App secret.\n"
-                "3. Dans Facebook Login / Valid OAuth Redirect URIs, ajoute :\n"
-                f"   {self._format_facebook_callback_url()}\n"
-                "4. Renseigne App ID, App secret, Graph version et Redirect port dans l'application, puis clique sur Enregistrer.\n"
-                "5. Clique sur Connecter : le navigateur s'ouvre, tu te connectes a Facebook puis tu selectionnes ta Page.\n\n"
-                "Champs a remplir dans l'application\n"
-                "- TikTok : Client key, Client secret, Redirect port\n"
-                "- Facebook : App ID, App secret, Graph version, Redirect port\n\n"
-                "Publication\n"
-                "- Une fois connecte, coche la ou les cibles, choisis une video compatible et clique sur Publier la video.\n"
-                "- Pour de meilleurs resultats, genere les videos avec la case Pour reseaux activee dans l'ecran Creer.\n"
-            ),
-        )
+        help_text.insert("1.0", self._build_social_help_text())
         help_text.configure(state="disabled")
 
         actions = tk.Frame(root, bg=self.colors["bg"])
@@ -3804,7 +3622,7 @@ class SoraVideoApp(tk.Tk):
 
     def _worker_connect_tiktok(self) -> None:
         try:
-            self.social_events.put(("log", "Ouverture du navigateur pour TikTok.", "system"))
+            self.social_events.put(("log", "Ouverture du navigateur pour TikTok Desktop Login Kit.", "system"))
             api = self._build_tiktok_api()
             token_payload = api.connect()
             creator_info = api.query_creator_info(str(token_payload.get("access_token") or ""))
@@ -4138,6 +3956,8 @@ class SoraVideoApp(tk.Tk):
                         self._refresh_social_state()
                         self._show_guided_config_error("facebook", "l'App secret Facebook")
                         continue
+                    if context == "tiktok":
+                        message = self._build_tiktok_connect_error_message(message)
                     self._set_social_status(f"Erreur {context}: {message}")
                     self._append_log(f"Erreur {context}: {message}", "error")
                     self._refresh_social_state()
@@ -4245,6 +4065,12 @@ class SoraVideoApp(tk.Tk):
     def _render_recent_history_sidebar(self) -> None:
         if self.recent_history_list is None:
             return
+        sidebar_wrap = self._available_wraplength(
+            self.sidebar_frame,
+            220 if self.layout_mode == "regular" else 180,
+            padding=48,
+            minimum=140,
+        )
         for child in self.recent_history_list.winfo_children():
             child.destroy()
 
@@ -4252,38 +4078,50 @@ class SoraVideoApp(tk.Tk):
             tk.Label(
                 self.recent_history_list,
                 textvariable=self.recent_history_empty_var,
-                bg=self.colors["sidebar"],
+                bg=self.colors["sidebar_alt"],
                 fg=self.colors["muted_soft"],
                 font=self.fonts["ui_small"],
                 justify="left",
-                wraplength=230,
+                wraplength=sidebar_wrap,
             ).pack(fill="x", padx=6, pady=6)
             return
 
         for record in self.video_records[:18]:
             record_id = str(record.get("id") or "")
             active = record_id == self.selected_record_id
-            bg = self.colors["sidebar_item_active"] if active else self.colors["sidebar"]
+            bg = self.colors["sidebar_item_active"] if active else self.colors["sidebar_item"]
             card = tk.Frame(
                 self.recent_history_list,
                 bg=bg,
                 padx=10,
-                pady=8,
-                highlightthickness=1 if active else 0,
-                highlightbackground=self.colors["panel_border"],
+                pady=10,
+                highlightthickness=1,
+                highlightbackground=self.colors["accent"] if active else self.colors["panel_border"],
             )
             card.pack(fill="x", padx=4, pady=(0, 6))
+            name = str(record.get("name") or os.path.basename(str(record.get("path") or "")) or "video.mp4")
             title = tk.Label(
                 card,
-                text=self._record_prompt_preview(record),
+                text=name,
                 bg=bg,
-                fg=self.colors["ink"] if active else self.colors["muted"],
-                font=self.fonts["ui_small"],
+                fg=self.colors["ink"],
+                font=self.fonts["ui_bold_small"],
                 justify="left",
-                wraplength=220,
+                wraplength=sidebar_wrap,
                 anchor="w",
             )
             title.pack(fill="x")
+            preview = tk.Label(
+                card,
+                text=self._record_prompt_preview(record),
+                bg=bg,
+                fg=self.colors["hero_subtle"] if active else self.colors["muted"],
+                font=self.fonts["ui_caption"],
+                justify="left",
+                wraplength=sidebar_wrap,
+                anchor="w",
+            )
+            preview.pack(fill="x", pady=(4, 0))
             meta = tk.Label(
                 card,
                 text=self._format_history_date(str(record.get("created_at") or "")),
@@ -4298,6 +4136,12 @@ class SoraVideoApp(tk.Tk):
     def _render_library_cards(self) -> None:
         if self.library_cards_frame is None:
             return
+        card_wrap = self._available_wraplength(
+            self.library_layout.get("list_card"),
+            520 if self.layout_mode == "regular" else 720,
+            padding=84,
+            minimum=240,
+        )
         for child in self.library_cards_frame.winfo_children():
             child.destroy()
 
@@ -4309,7 +4153,7 @@ class SoraVideoApp(tk.Tk):
                 bg=self.colors["panel"],
                 fg=self.colors["muted"],
                 font=self.fonts["ui_small"],
-                wraplength=520,
+                wraplength=card_wrap,
                 justify="left",
             ).pack(fill="x", padx=12, pady=12)
             return
@@ -4318,25 +4162,50 @@ class SoraVideoApp(tk.Tk):
             record_id = str(record.get("id") or "")
             active = record_id == self.selected_record_id
             bg = self.colors["panel_alt_2"] if active else self.colors["panel_alt"]
+            path = str(record.get("path") or "")
+            file_exists = bool(path and os.path.exists(path))
             card = tk.Frame(
                 self.library_cards_frame,
                 bg=bg,
-                padx=14,
-                pady=12,
+                padx=16,
+                pady=14,
                 highlightthickness=1,
                 highlightbackground=self.colors["accent"] if active else self.colors["panel_border"],
             )
             card.pack(fill="x", padx=8, pady=(0, 10))
+            header = tk.Frame(card, bg=bg)
+            header.pack(fill="x")
+            header.columnconfigure(0, weight=1)
             tk.Label(
-                card,
-                text=self._record_prompt_preview(record),
+                header,
+                text=str(record.get("name") or os.path.basename(path) or "video.mp4"),
                 bg=bg,
                 fg=self.colors["ink"],
                 font=self.fonts["ui_bold"],
                 justify="left",
                 anchor="w",
-                wraplength=520,
-            ).pack(fill="x")
+                wraplength=card_wrap,
+            ).grid(row=0, column=0, sticky="w")
+            if not file_exists:
+                tk.Label(
+                    header,
+                    text="Introuvable",
+                    bg=self.colors["warm_soft"],
+                    fg=self.colors["error_text"],
+                    font=self.fonts["ui_caption"],
+                    padx=8,
+                    pady=3,
+                ).grid(row=0, column=1, sticky="e")
+            tk.Label(
+                card,
+                text=self._record_prompt_preview(record),
+                bg=bg,
+                fg=self.colors["hero_subtle"] if active else self.colors["muted"],
+                font=self.fonts["ui_small"],
+                justify="left",
+                anchor="w",
+                wraplength=card_wrap,
+            ).pack(fill="x", pady=(8, 0))
             tk.Label(
                 card,
                 text=(
@@ -4349,7 +4218,7 @@ class SoraVideoApp(tk.Tk):
                 font=self.fonts["ui_caption"],
                 justify="left",
                 anchor="w",
-            ).pack(fill="x", pady=(6, 0))
+            ).pack(fill="x", pady=(8, 0))
             self._bind_click_recursive(card, lambda rid=record_id: self._select_history_record(rid))
 
     def _refresh_history_view(self) -> None:
@@ -4412,6 +4281,44 @@ class SoraVideoApp(tk.Tk):
             else:
                 self.history_delete_btn.state(["disabled"])
 
+    def _set_history_status_panel(self, tone: str, title: str, note: str) -> None:
+        self.history_status_var.set(title)
+        self.history_status_note_var.set(note)
+        if (
+            self.history_status_panel is None
+            or self.history_status_title_label is None
+            or self.history_status_note_label is None
+        ):
+            return
+        palette = {
+            "idle": (
+                self.colors["panel_tint"],
+                self.colors["ink"],
+                self.colors["muted"],
+            ),
+            "ready": (
+                self.colors["accent_soft_2"],
+                self.colors["success_text"],
+                self.colors["hero_subtle"],
+            ),
+            "warn": (
+                self.colors["warm_soft"],
+                self.colors["error_text"],
+                self.colors["error_text"],
+            ),
+        }
+        background, title_fg, note_fg = palette.get(
+            tone,
+            (self.colors["panel_tint"], self.colors["ink"], self.colors["muted"]),
+        )
+        self.history_status_panel.configure(bg=background)
+        self.history_status_title_label.configure(bg=background, fg=title_fg)
+        self.history_status_note_label.configure(bg=background, fg=note_fg)
+
+    def _apply_history_detail_items(self, items: dict[str, str]) -> None:
+        for key, _label in LIBRARY_DETAIL_FIELDS:
+            self.history_detail_vars[key].set(items.get(key, "-"))
+
     def _get_selected_history_record(self) -> Optional[dict[str, Any]]:
         if not self.selected_record_id:
             return None
@@ -4435,39 +4342,49 @@ class SoraVideoApp(tk.Tk):
         if not record:
             self.history_title_var.set("Aucune vidéo sélectionnée")
             self.history_meta_var.set("Sélectionne un rendu pour voir ses détails.")
-            self.history_prompt_var.set("Aucun prompt enregistré.")
-            self.history_details_var.set(
-                "Sélectionne une vidéo pour afficher son résumé, son état et son chemin complet."
+            self._set_history_status_panel(
+                "idle",
+                "Aucune vidéo sélectionnée",
+                "Choisis un rendu pour ouvrir la vidéo ou réutiliser son prompt.",
             )
+            self._set_readonly_text(self.history_prompt_textbox, "Aucun prompt enregistré.")
+            self._apply_history_detail_items({})
             self._set_history_actions_state(has_selection=False, file_exists=False)
             return
 
         path = str(record.get("path") or "")
         exists = os.path.exists(path)
-        status_label = "Disponible" if exists else "Fichier introuvable"
-        duration = record.get("duration_seconds")
-        duration_label = f"{duration}s" if isinstance(duration, int) else "-"
+        formatted_date = self._format_history_date(str(record.get("created_at") or ""))
         self.history_title_var.set(str(record.get("name") or os.path.basename(path) or "video.mp4"))
         self.history_meta_var.set(
-            f"{self._format_history_date(str(record.get('created_at') or ''))} • "
+            f"{formatted_date} • "
             f"{record.get('model') or '-'} • {record.get('resolution') or '-'}"
         )
-        self.history_prompt_var.set(
-            str(record.get("prompt") or "Aucun prompt enregistré pour ce rendu.")
+        self._set_readonly_text(
+            self.history_prompt_textbox,
+            str(record.get("prompt") or "Aucun prompt enregistré pour ce rendu."),
         )
-        details = [
-            f"Nom : {record.get('name') or os.path.basename(path) or 'video.mp4'}",
-            f"Modele : {record.get('model') or '-'}",
-            f"Duree : {duration_label}",
-            f"Format : {record.get('resolution') or '-'}",
-            f"Reseaux : {'Pret' if self._is_record_social_ready(record) else 'Classique'}",
-            f"Publications : {len(record.get('social_posts') or [])}",
-            f"Taille : {self._format_file_size(record.get('bytes'))}",
-            f"Date : {self._format_history_date(str(record.get('created_at') or ''))}",
-            f"Etat : {status_label}",
-            f"Chemin : {path or '-'}",
-        ]
-        self.history_details_var.set("\n".join(details))
+        self._apply_history_detail_items(
+            build_history_detail_items(
+                record,
+                file_exists=exists,
+                formatted_date=formatted_date,
+                formatted_size=self._format_file_size(record.get("bytes")),
+                social_ready=self._is_record_social_ready(record),
+            )
+        )
+        if exists:
+            self._set_history_status_panel(
+                "ready",
+                "Fichier disponible",
+                "Le bouton Ouvrir la vidéo lance le fichier dans l'application système par défaut.",
+            )
+        else:
+            self._set_history_status_panel(
+                "warn",
+                "Fichier introuvable",
+                "La vidéo a été déplacée ou supprimée du disque. Réutiliser et Supprimer restent disponibles.",
+            )
         self._set_history_actions_state(has_selection=True, file_exists=exists)
 
     def _history_refresh(self) -> None:

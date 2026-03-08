@@ -1,30 +1,53 @@
+import http.client
 import json
 import os
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
 
 import sora2_video
-from social_integrations import SOCIAL_DEFAULT_SIZE, FacebookAPI, TikTokAPI, is_social_size, normalize_social_posts
+from social_integrations import (
+    SOCIAL_DEFAULT_SIZE,
+    FacebookAPI,
+    TikTokAPI,
+    _OAuthCallbackServer,
+    is_social_size,
+    normalize_social_posts,
+)
 from sora2_video import (
     FACEBOOK_APP_SECRET_KEYRING_NAME,
     TIKTOK_CLIENT_SECRET_KEYRING_NAME,
+    build_history_detail_items,
     build_prompt_preview,
+    choose_layout_mode,
+    compute_initial_window_geometry,
     load_env,
     normalize_history_record,
 )
 
 
 class FakeVar:
-    def __init__(self, value: str = "") -> None:
+    def __init__(self, value: object = "") -> None:
         self.value = value
 
-    def get(self) -> str:
+    def get(self) -> object:
         return self.value
 
-    def set(self, value: str) -> None:
+    def set(self, value: object) -> None:
         self.value = value
+
+
+class FakeButton:
+    def __init__(self) -> None:
+        self.disabled = False
+
+    def state(self, commands: list[str]) -> None:
+        if "disabled" in commands:
+            self.disabled = True
+        if "!disabled" in commands:
+            self.disabled = False
 
 
 def make_social_app_stub(workdir: str) -> types.SimpleNamespace:
@@ -55,6 +78,12 @@ def make_social_app_stub(workdir: str) -> types.SimpleNamespace:
         "_get_tiktok_settings",
         "_get_facebook_settings",
         "_sync_social_settings_vars",
+        "_format_tiktok_callback_url",
+        "_format_facebook_callback_url",
+        "_build_tiktok_connect_hint_text",
+        "_build_tiktok_guided_config_message",
+        "_build_tiktok_connect_error_message",
+        "_build_social_help_text",
         "_save_social_accounts",
         "_load_social_accounts",
         "_build_tiktok_api",
@@ -68,7 +97,44 @@ def make_social_app_stub(workdir: str) -> types.SimpleNamespace:
     return app
 
 
+def make_history_actions_stub() -> types.SimpleNamespace:
+    app = types.SimpleNamespace()
+    app.history_open_btn = FakeButton()
+    app.history_export_btn = FakeButton()
+    app.history_reuse_btn = FakeButton()
+    app.history_delete_btn = FakeButton()
+    app._set_history_actions_state = types.MethodType(
+        getattr(sora2_video.SoraVideoApp, "_set_history_actions_state"),
+        app,
+    )
+    return app
+
+
 class SocialIntegrationTests(unittest.TestCase):
+    def _exercise_callback_request(self, request_path: str) -> None:
+        server = _OAuthCallbackServer(("127.0.0.1", 0), "/tiktok/callback")
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
+        thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        try:
+            connection.request("GET", f"{request_path}?code=demo-code&state=demo-state")
+            response = connection.getresponse()
+            body = response.read().decode("utf-8")
+            self.assertEqual(response.status, 200)
+            self.assertIn("Connexion terminee", body)
+            self.assertTrue(server.event.wait(1))
+            self.assertEqual(server.payload["code"], "demo-code")
+            self.assertEqual(server.payload["state"], "demo-state")
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
     def test_build_prompt_preview_uses_fallback_and_truncates(self) -> None:
         self.assertEqual(build_prompt_preview("", fallback="Paris de nuit"), "Paris de nuit")
         preview = build_prompt_preview(" ".join(["plan"] * 40), max_length=24)
@@ -158,6 +224,39 @@ class SocialIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["publish_id"], "x-1")
         self.assertEqual(rows[0]["remote_id"], "x-1")
+
+    def test_tiktok_redirect_uri_uses_loopback_http_callback(self) -> None:
+        api = TikTokAPI(client_key="demo-key", redirect_port=9911)
+        self.assertEqual(api.redirect_uri, "http://127.0.0.1:9911/tiktok/callback")
+
+    def test_oauth_callback_accepts_path_with_or_without_trailing_slash(self) -> None:
+        for request_path in ("/tiktok/callback", "/tiktok/callback/"):
+            with self.subTest(request_path=request_path):
+                self._exercise_callback_request(request_path)
+
+    def test_tiktok_help_and_guidance_call_out_desktop_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = make_social_app_stub(temp_dir)
+            help_text = app._build_social_help_text()
+            config_message = app._build_tiktok_guided_config_message("le Client key TikTok")
+
+        self.assertIn("Desktop Login Kit", help_text)
+        self.assertIn("http://127.0.0.1:8765/tiktok/callback", help_text)
+        self.assertIn("target user Sandbox", help_text)
+        self.assertIn("Desktop Login Kit", config_message)
+        self.assertIn("http://127.0.0.1:8765/tiktok/callback", config_message)
+        self.assertIn("https://", config_message)
+
+    def test_tiktok_timeout_error_gets_desktop_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = make_social_app_stub(temp_dir)
+            message = app._build_tiktok_connect_error_message(
+                "Connexion annulee ou expiree avant retour OAuth."
+            )
+
+        self.assertIn("Desktop Login Kit", message)
+        self.assertIn("http://127.0.0.1:8765/tiktok/callback", message)
+        self.assertIn("Sandbox", message)
 
     def test_load_env_overrides_managed_app_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -291,6 +390,62 @@ class SocialIntegrationTests(unittest.TestCase):
             self.assertEqual(tiktok_api.client_secret, "tk-secret")
             self.assertIsInstance(facebook_api, FacebookAPI)
             self.assertEqual(facebook_api.app_secret, "fb-secret")
+
+
+class FrontendSupportTests(unittest.TestCase):
+    def test_choose_layout_mode_switches_to_compact_below_threshold(self) -> None:
+        self.assertEqual(choose_layout_mode(1439, 900), "compact")
+        self.assertEqual(choose_layout_mode(1600, 819), "compact")
+        self.assertEqual(choose_layout_mode(1440, 820), "regular")
+
+    def test_compute_initial_window_geometry_is_centered_for_1366x768(self) -> None:
+        geometry = compute_initial_window_geometry(1366, 768)
+        self.assertEqual(geometry, (1326, 720, 20, 24))
+
+    def test_build_history_detail_items_formats_library_grid_values(self) -> None:
+        values = build_history_detail_items(
+            {
+                "model": "sora-2",
+                "duration_seconds": 12,
+                "resolution": "1280x720",
+                "social_posts": [{"id": "1"}, {"id": "2"}],
+                "path": "C:/videos/demo.mp4",
+            },
+            file_exists=False,
+            formatted_date="08/03/2026 01:20",
+            formatted_size="8.2 MB",
+            social_ready=True,
+        )
+
+        self.assertEqual(values["modele"], "sora-2")
+        self.assertEqual(values["duree"], "12s")
+        self.assertEqual(values["format"], "1280x720")
+        self.assertEqual(values["taille"], "8.2 MB")
+        self.assertEqual(values["reseaux"], "Prêt")
+        self.assertEqual(values["publications"], "2")
+        self.assertEqual(values["date"], "08/03/2026 01:20")
+        self.assertEqual(values["etat"], "Fichier introuvable")
+        self.assertEqual(values["chemin"], "C:/videos/demo.mp4")
+
+    def test_history_actions_state_keeps_reuse_and_delete_when_file_missing(self) -> None:
+        app = make_history_actions_stub()
+
+        app._set_history_actions_state(has_selection=True, file_exists=False)
+
+        self.assertTrue(app.history_open_btn.disabled)
+        self.assertTrue(app.history_export_btn.disabled)
+        self.assertFalse(app.history_reuse_btn.disabled)
+        self.assertFalse(app.history_delete_btn.disabled)
+
+    def test_history_actions_state_enables_open_and_export_when_file_exists(self) -> None:
+        app = make_history_actions_stub()
+
+        app._set_history_actions_state(has_selection=True, file_exists=True)
+
+        self.assertFalse(app.history_open_btn.disabled)
+        self.assertFalse(app.history_export_btn.disabled)
+        self.assertFalse(app.history_reuse_btn.disabled)
+        self.assertFalse(app.history_delete_btn.disabled)
 
 
 if __name__ == "__main__":
